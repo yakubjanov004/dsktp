@@ -1,0 +1,18 @@
+[Unit]
+Description=AlfaConnect Telegram Bot va Backend API Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vboxuser/Desktop/alfaconnect
+User=vboxuser
+EnvironmentFile=/home/vboxuser/Desktop/alfaconnect/.env
+EnvironmentFile=/home/vboxuser/Desktop/alfaconnect/.env.production
+ExecStart=/home/vboxuser/Desktop/alfaconnect/venv/bin/python /home/vboxuser/Desktop/alfaconnect/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

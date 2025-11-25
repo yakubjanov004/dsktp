@@ -1,0 +1,4 @@
+"""
+WebApp database queries module
+"""
+
