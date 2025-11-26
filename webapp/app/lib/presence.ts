@@ -1,7 +1,27 @@
+import { getRuntimeConfig } from "./api"
+import { buildNgrokBypassHeaders, normalizeBaseUrl } from "./network"
+
 /**
  * User presence utilities
  * Helper functions for online/offline status and last seen labels
  */
+
+let presenceApiBase = normalizeBaseUrl(process.env.NEXT_PUBLIC_API_BASE || "/api") || "/api"
+
+async function resolvePresenceApiBase(): Promise<string> {
+  if (presenceApiBase && presenceApiBase !== "/api") {
+    return presenceApiBase
+  }
+  try {
+    const config = await getRuntimeConfig()
+    if (config?.apiBaseUrl) {
+      presenceApiBase = normalizeBaseUrl(config.apiBaseUrl) || "/api"
+    }
+  } catch (error) {
+    console.warn("[presence] Failed to resolve runtime API base:", error)
+  }
+  return presenceApiBase
+}
 
 /**
  * Set user online/offline status (heartbeat)
@@ -20,7 +40,7 @@ export async function setOnlineStatus(isOnline: boolean): Promise<boolean> {
       return false
     }
 
-    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api"
+    const API_BASE = await resolvePresenceApiBase()
     const url = `${API_BASE}/user/me/status`
     
     // Use fetch with keepalive for offline status (page unload, visibility change)
@@ -29,12 +49,15 @@ export async function setOnlineStatus(isOnline: boolean): Promise<boolean> {
     // keepalive is supported in modern browsers and helps ensure the request completes
     const useKeepalive = !isOnline && typeof navigator !== 'undefined'
     
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Telegram-Init-Data": initData,
+      ...buildNgrokBypassHeaders(),
+    }
+
     const response = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Telegram-Init-Data": initData
-      },
+      headers,
       body: JSON.stringify({ is_online: isOnline }),
       credentials: "include",
       keepalive: useKeepalive  // Keep connection alive for faster send on page unload

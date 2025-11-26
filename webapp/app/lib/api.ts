@@ -4,11 +4,24 @@
  * Production: Uses relative /api path (no CORS issues)
  */
 
-import { buildWsUrl } from "./wsUrl"
+import { buildWsUrl, setRuntimeWsBaseUrl } from "./wsUrl"
+import { buildNgrokBypassHeaders, normalizeBaseUrl } from "./network"
 
 // Use relative path - Next.js rewrites will proxy /api/* to backend
 // Works for both localhost and Ngrok domain
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "/api"
+let API_BASE = normalizeBaseUrl(process.env.NEXT_PUBLIC_API_BASE || "/api") || "/api"
+
+function setApiBase(newBase?: string | null) {
+  const normalized = normalizeBaseUrl(newBase) || "/api"
+  if (API_BASE !== normalized) {
+    console.log(`[api] Updating API_BASE -> ${normalized}`)
+    API_BASE = normalized
+  }
+}
+
+function getApiBase(): string {
+  return API_BASE || "/api"
+}
 
 // API request timeout (30 seconds)
 const API_TIMEOUT = 30000
@@ -17,23 +30,55 @@ const MAX_RETRIES = 3
 // Retry delay (ms)
 const RETRY_DELAY = 1000
 
+function mergeHeaders(headersInit?: HeadersInit): Headers {
+  const baseHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Connection': 'keep-alive',
+    ...buildNgrokBypassHeaders(),
+  }
+
+  const headers = new Headers(baseHeaders)
+
+  if (!headersInit) {
+    return headers
+  }
+
+  if (headersInit instanceof Headers) {
+    headersInit.forEach((value, key) => headers.set(key, value))
+    return headers
+  }
+
+  if (Array.isArray(headersInit)) {
+    headersInit.forEach(([key, value]) => {
+      headers.set(key, value)
+    })
+    return headers
+  }
+
+  Object.entries(headersInit).forEach(([key, value]) => {
+    if (typeof value !== "undefined") {
+      headers.set(key, value as string)
+    }
+  })
+
+  return headers
+}
+
 /**
  * Enhanced fetch with timeout, retry logic and error handling
  */
 async function apiFetch(url: string, options: RequestInit = {}, retries = MAX_RETRIES): Promise<Response> {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT)
+  const { headers: optionHeaders, ...restOptions } = options
+  const headers = mergeHeaders(optionHeaders)
   
   try {
     console.log(`[apiFetch] Requesting: ${url}`)
     const response = await fetch(url, {
-      ...options,
+      ...restOptions,
       signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'Connection': 'keep-alive',
-        ...options.headers,
-      },
+      headers,
     })
     
     clearTimeout(timeoutId)
@@ -100,12 +145,18 @@ export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
   }
 
   try {
+    const originParam = typeof window !== 'undefined' ? window.location.origin : null
+    const runtimeApiBase = getApiBase()
+    const configEndpoint = originParam 
+      ? `${runtimeApiBase}/config?origin=${encodeURIComponent(originParam)}`
+      : `${runtimeApiBase}/config`
+
     console.log("🔄 [fetchRuntimeConfig] Fetching runtime configuration...")
-    console.log(`   📍 API_BASE: ${API_BASE}`)
-    console.log(`   📍 Window origin: ${typeof window !== 'undefined' ? window.location.origin : 'N/A'}`)
-    console.log(`   📍 Requesting: ${API_BASE}/config`)
+    console.log(`   📍 Current API_BASE: ${runtimeApiBase}`)
+    console.log(`   📍 Window origin: ${originParam || 'N/A'}`)
+    console.log(`   📍 Requesting: ${configEndpoint}`)
     
-    const res = await apiFetch(`${API_BASE}/config`)
+    const res = await apiFetch(configEndpoint)
     
     if (!res.ok) {
       const statusText = res.statusText || `HTTP ${res.status}`
@@ -116,6 +167,12 @@ export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
     }
     
     runtimeConfig = await res.json()
+    if (runtimeConfig?.apiBaseUrl) {
+      setApiBase(runtimeConfig.apiBaseUrl)
+    }
+    if (runtimeConfig?.wsBaseUrl) {
+      setRuntimeWsBaseUrl(runtimeConfig.wsBaseUrl)
+    }
     if (runtimeConfig) {
       console.log("✅ [fetchRuntimeConfig] Config loaded successfully:", {
         apiBaseUrl: runtimeConfig.apiBaseUrl,
@@ -130,11 +187,14 @@ export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
     console.error("❌ [fetchRuntimeConfig] Failed:", errorMsg)
     console.error("   🔄 Falling back to default values")
     // Fallback to default API_BASE
+    const fallbackApiBase = getApiBase()
+    const fallbackWsBase = fallbackApiBase.replace(/^http/, "ws")
     runtimeConfig = {
-      apiBaseUrl: API_BASE,
-      wsBaseUrl: API_BASE.replace(/^http/, "ws"),
+      apiBaseUrl: fallbackApiBase,
+      wsBaseUrl: fallbackWsBase,
       timestamp: new Date().toISOString(),
     }
+    setRuntimeWsBaseUrl(runtimeConfig.wsBaseUrl)
     console.log("   ⚠️  Using fallback config:", runtimeConfig)
     return runtimeConfig
   }

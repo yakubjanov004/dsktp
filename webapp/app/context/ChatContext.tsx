@@ -31,6 +31,7 @@ import {
   getAvailableStaff,
   type StaffChat,
 } from "../lib/api"
+import { normalizeChatId, normalizeChatIdNumber } from "@/utils/chatId"
 
 // Convert database Chat to ChatSession format
 interface ChatSession {
@@ -256,9 +257,14 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     }
 
     try {
-      console.log(`✅ [WS-CREATE] Creating WebSocket: chat=${chatId}, user=${userId}, role=${userRoleRef.current}`)
+      const chatIdNum = normalizeChatIdNumber(chatId)
+      if (chatIdNum === null || chatIdNum <= 0) {
+        console.warn('[ChatContext] initializeWebSocket: Invalid chatId for WS connection', { chatId })
+        return
+      }
+      console.log(`✅ [WS-CREATE] Creating WebSocket: chat=${chatIdNum}, user=${userId}, role=${userRoleRef.current}`)
       const ws = new ChatWebSocket(
-        parseInt(chatId),
+        chatIdNum,
         currentTelegramId,
         userId,
         (message: Message) => {
@@ -452,32 +458,37 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
   // Load messages for a specific chat (with sync support via since_ts/since_id)
   // Defined before loadChats so it can be used in loadChats
   const loadChatMessages = useCallback(async (chatId: string, force: boolean = false, sinceTs?: string, sinceId?: number) => {
+    const chatIdNum = normalizeChatIdNumber(chatId)
+    if (chatIdNum === null || chatIdNum <= 0) {
+      console.error('[ChatContext] loadChatMessages: Invalid chatId received', { chatId })
+      return
+    }
+    const chatKey = chatIdNum.toString()
+    
     // If forced, reset loaded state to ensure fresh reload
     if (force) {
-      loadedMessagesRef.current.delete(chatId)
+      loadedMessagesRef.current.delete(chatKey)
     }
     
     // Prevent duplicate simultaneous calls (unless forced)
-    if (!force && loadingMessagesRef.current.has(chatId)) {
+    if (!force && loadingMessagesRef.current.has(chatKey)) {
       return
     }
     
     // If forced, always reload (for persistence - get latest messages from database)
     // Otherwise check if messages are already loaded
-    if (!force && loadedMessagesRef.current.has(chatId)) {
+    if (!force && loadedMessagesRef.current.has(chatKey)) {
       return
     }
     
-    loadingMessagesRef.current.add(chatId)
+    loadingMessagesRef.current.add(chatKey)
     
     try {
       // First, ensure chat exists in sessions
       setChatSessions((prev) => {
-        const chatExists = prev.some((chat) => chat.id === chatId)
+        const chatExists = prev.some((chat) => chat.id === chatKey)
         if (!chatExists) {
-          // Try to load chat by ID (for supervisors viewing any chat)
-          // This will be handled asynchronously, so we'll load messages anyway
-          console.warn(`Chat ${chatId} not found in sessions. Will try to load chat first.`)
+          console.warn(`Chat ${chatKey} (raw: ${chatId}) not found in sessions. Will try to load chat first.`)
         }
         return prev
       })
@@ -487,7 +498,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       // For supervisors/operators, try to load chat if it doesn't exist
       let chatExists = false
       setChatSessions((prev) => {
-        chatExists = prev.some((chat) => chat.id === chatId)
+        chatExists = prev.some((chat) => chat.id === chatKey)
         return prev
       })
       
@@ -496,12 +507,12 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       // we'll still load messages - they will be attached when chat is added
       if (!chatExists && userRoleRef.current !== 'client') {
         try {
-          const chat = await getChat(parseInt(chatId))
+          const chat = await getChat(chatIdNum)
           if (chat) {
             const session = convertChatToSession(chat)
             setChatSessions((prev) => {
               // Check again to avoid duplicates
-              if (prev.some((c) => c.id === chatId)) {
+              if (prev.some((c) => c.id === chatKey)) {
                 return prev
               }
               return [...prev, session]
@@ -516,30 +527,23 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       // For clients: if chat doesn't exist yet, log warning but continue loading messages
       // The chat will be added to sessions soon (from loadChats), and messages will be attached
       if (!chatExists && userRoleRef.current === 'client') {
-        console.log(`[ChatContext] loadChatMessages: Chat ${chatId} not in sessions yet for client, but proceeding to load messages anyway`)
+        console.log(`[ChatContext] loadChatMessages: Chat ${chatKey} (raw: ${chatId}) not in sessions yet for client, but proceeding to load messages anyway`)
       }
       
       // Load messages - use since_ts/since_id for sync, otherwise load initial batch
       // For force=true (when entering chat), load ALL messages to show full chat history
-      console.log('[ChatContext] loadChatMessages: Loading messages for chatId:', chatId, 'force:', force, 'sinceTs:', sinceTs, 'sinceId:', sinceId)
-      
-      // Validate chatId
-      const chatIdNum = parseInt(chatId)
-      if (isNaN(chatIdNum) || chatIdNum <= 0) {
-        console.error('[ChatContext] loadChatMessages: Invalid chatId:', chatId)
-        throw new Error(`Invalid chat ID: ${chatId}`)
-      }
+      console.log('[ChatContext] loadChatMessages: Loading messages for chatId:', chatKey, '(raw:', chatId, ') force:', force, 'sinceTs:', sinceTs, 'sinceId:', sinceId)
       
       // If force=true and not in sync mode, load ALL messages at once (for supervisors viewing full chat history)
       // Otherwise, use pagination
       let messages: Message[] = []
       if (force && !sinceTs && !sinceId) {
         // Load all messages in one request (chronological order, oldest first)
-        console.log('[ChatContext] loadChatMessages: Loading ALL messages for chatId:', chatId, 'chatIdNum:', chatIdNum)
+        console.log('[ChatContext] loadChatMessages: Loading ALL messages for chatId:', chatKey, 'chatIdNum:', chatIdNum)
         messages = await getChatMessages(chatIdNum, 100, 0, undefined, undefined, undefined, undefined, true)
         if (messages.length === 0) {
-          console.warn('[ChatContext] loadChatMessages: ⚠️ No messages returned for chatId:', chatId, 'This might indicate:', {
-            chatId,
+          console.warn('[ChatContext] loadChatMessages: ⚠️ No messages returned for chatId:', chatKey, 'This might indicate:', {
+            chatId: chatKey,
             chatIdNum,
             possibleIssues: [
               'Chat does not exist in database',
@@ -549,32 +553,32 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
             ]
           })
         } else {
-          console.log('[ChatContext] loadChatMessages: ✅ Loaded', messages.length, 'total messages for chatId:', chatId)
+          console.log('[ChatContext] loadChatMessages: ✅ Loaded', messages.length, 'total messages for chatId:', chatKey)
         }
         
         // Messages are already in chronological order (oldest first) from backend
         const sortedAllMessages = messages
         
         console.log('[ChatContext] loadChatMessages: About to update chat session:', {
-          chatId,
+          chatId: chatKey,
           messagesCount: sortedAllMessages.length,
           firstMessage: sortedAllMessages.length > 0 ? sortedAllMessages[0] : null,
           lastMessage: sortedAllMessages.length > 0 ? sortedAllMessages[sortedAllMessages.length - 1] : null
         })
         
         setChatSessions((prev) => {
-          const chatExists = prev.some((chat) => chat.id === chatId)
+          const chatExists = prev.some((chat) => chat.id === chatKey)
           console.log('[ChatContext] loadChatMessages: Updating chat session with ALL messages:', {
-            chatId,
+            chatId: chatKey,
             chatExists,
             messagesCount: sortedAllMessages.length,
             prevChatsCount: prev.length,
-            existingChatMessagesCount: chatExists ? prev.find(c => c.id === chatId)?.messages?.length || 0 : 0
+            existingChatMessagesCount: chatExists ? prev.find(c => c.id === chatKey)?.messages?.length || 0 : 0
           })
           
           if (!chatExists) {
             const minimalChat: ChatSession = {
-              id: chatId,
+              id: chatKey,
               clientId: '',
               operatorId: null,
               status: 'active',
@@ -590,10 +594,10 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
           }
           
           const updated = prev.map((chat) => {
-            if (chat.id === chatId) {
+            if (chat.id === chatKey) {
               if (sortedAllMessages.length > 0) {
                 const lastMsg = sortedAllMessages[sortedAllMessages.length - 1]
-                lastMessageDataRef.current[chatId] = {
+                lastMessageDataRef.current[chatKey] = {
                   id: lastMsg.id,
                   ts: lastMsg.created_at
                 }
@@ -614,21 +618,21 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
           return updated
         })
         
-        loadedMessagesRef.current.add(chatId)
-        loadingMessagesRef.current.delete(chatId)
+        loadedMessagesRef.current.add(chatKey)
+        loadingMessagesRef.current.delete(chatKey)
         return
       } else {
         // Use pagination for sync or normal loading
         const limit = sinceTs || sinceId ? 100 : 50
         messages = await getChatMessages(chatIdNum, limit, 0, sinceTs, sinceId)
         if (messages.length === 0) {
-          console.warn('[ChatContext] loadChatMessages: ⚠️ No messages returned (pagination mode) for chatId:', chatId)
+          console.warn('[ChatContext] loadChatMessages: ⚠️ No messages returned (pagination mode) for chatId:', chatKey)
         } else {
-          console.log('[ChatContext] loadChatMessages: ✅ Received', messages.length, 'messages for chatId:', chatId)
+          console.log('[ChatContext] loadChatMessages: ✅ Received', messages.length, 'messages for chatId:', chatKey)
         }
       }
       
-      console.log('[ChatContext] loadChatMessages: Received messages:', messages.length, 'messages for chatId:', chatId)
+      console.log('[ChatContext] loadChatMessages: Received messages:', messages.length, 'messages for chatId:', chatKey)
       
       setChatSessions((prev) => {
         // Sort messages by created_at (oldest first)
@@ -636,16 +640,16 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
           (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         )
         
-        const chatExists = prev.some((chat) => chat.id === chatId)
+        const chatExists = prev.some((chat) => chat.id === chatKey)
         if (!chatExists) {
           // For clients: chat should be loaded via loadChats, but if it's not here yet,
           // we'll create a minimal chat session with messages
           // This can happen due to async state updates
           // For supervisors/operators: also create minimal chat session if chat doesn't exist
-          console.log(`[ChatContext] loadChatMessages: Chat ${chatId} not in sessions yet, creating minimal session with messages for role: ${userRoleRef.current}`)
+          console.log(`[ChatContext] loadChatMessages: Chat ${chatKey} not in sessions yet, creating minimal session with messages for role: ${userRoleRef.current}`)
           // Create a minimal chat session - it will be updated when chat is loaded
           const minimalChat: ChatSession = {
-            id: chatId,
+            id: chatKey,
             clientId: '', // Will be updated when chat is loaded
             operatorId: null,
             status: 'active',
@@ -658,11 +662,11 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
         }
         
         return prev.map((chat) => {
-          if (chat.id === chatId) {
+          if (chat.id === chatKey) {
             // Update last message tracking
             if (sortedMessages.length > 0) {
               const lastMsg = sortedMessages[sortedMessages.length - 1]
-              lastMessageDataRef.current[chatId] = {
+              lastMessageDataRef.current[chatKey] = {
                 id: lastMsg.id,
                 ts: lastMsg.created_at
               }
@@ -674,7 +678,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
             let finalMessages = sortedMessages
             
             console.log('[ChatContext] loadChatMessages: Updating chat session:', {
-              chatId,
+              chatId: chatKey,
               existingMessagesCount: existingMessages.length,
               newMessagesCount: sortedMessages.length,
               force,
@@ -725,7 +729,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
             }
             
             console.log('[ChatContext] loadChatMessages: Updated chat session:', {
-              chatId,
+              chatId: chatKey,
               finalMessagesCount: updatedChat.messages.length,
               hasLastMessage: !!updatedChat.lastMessage
             })
@@ -741,51 +745,51 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       const currentUserId = userIdRef.current
       const currentUserRole = userRoleRef.current
       console.log('[ChatContext] loadChatMessages: WebSocket check:', {
-        chatId,
+        chatId: chatKey,
         currentUserId,
         currentUserRole,
-        hasSubscription: subscribedChatIdsRef.current.has(chatId),
+        hasSubscription: subscribedChatIdsRef.current.has(chatKey),
         hasInitializeFn: !!initializeWebSocketRef.current
       })
       
       // IMPORTANT: Initialize WebSocket connection AFTER messages are loaded
       // This ensures chat exists in sessions before WebSocket is created
       // We do this for ALL users (client, operator, supervisor) to ensure real-time updates
-      loadedMessagesRef.current.add(chatId)
+      loadedMessagesRef.current.add(chatKey)
       
       // Initialize WebSocket connection for real-time updates
       // This is critical - messages must appear immediately when sent by other participants
-      if (currentUserId && !subscribedChatIdsRef.current.has(chatId)) {
+      if (currentUserId && !subscribedChatIdsRef.current.has(chatKey)) {
         // Check if WebSocket connection already exists in map (might be connecting)
-        const existingWs = wsConnections.current.get(chatId)
+        const existingWs = wsConnections.current.get(chatKey)
         if (existingWs) {
-          console.log('[ChatContext] loadChatMessages: WebSocket already exists in map for chat:', chatId)
+          console.log('[ChatContext] loadChatMessages: WebSocket already exists in map for chat:', chatKey)
           // Don't create duplicate connection, but continue with function
         } else {
           // Try to use ref first
           if (initializeWebSocketRef.current) {
-            console.log('[ChatContext] loadChatMessages: Initializing WebSocket for chat:', chatId, 'userId:', currentUserId, 'role:', currentUserRole)
-            initializeWebSocketRef.current(chatId, currentUserId)
+            console.log('[ChatContext] loadChatMessages: Initializing WebSocket for chat:', chatKey, 'userId:', currentUserId, 'role:', currentUserRole)
+            initializeWebSocketRef.current(chatKey, currentUserId)
           } else {
             // Fallback: add to activeChats which will call initializeWebSocket via addToActiveChats
             console.warn('[ChatContext] loadChatMessages: initializeWebSocketRef.current is null, adding to activeChats to retry')
             setActiveChats((prev) => {
-              if (!prev.includes(chatId)) {
-                return [...prev, chatId]
+              if (!prev.includes(chatKey)) {
+                return [...prev, chatKey]
               }
               return prev
             })
           }
         }
-      } else if (subscribedChatIdsRef.current.has(chatId)) {
-        console.log('[ChatContext] loadChatMessages: WebSocket already subscribed for chat:', chatId)
+      } else if (subscribedChatIdsRef.current.has(chatKey)) {
+        console.log('[ChatContext] loadChatMessages: WebSocket already subscribed for chat:', chatKey)
       } else if (!currentUserId) {
         console.warn('[ChatContext] loadChatMessages: currentUserId is not available, WebSocket will not be created')
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      console.error(`[ChatContext] loadChatMessages: Error loading messages for chat ${chatId}:`, {
-        chatId,
+      console.error(`[ChatContext] loadChatMessages: Error loading messages for chat ${chatKey}:`, {
+        chatId: chatKey,
         error: errorMsg,
         stack: error instanceof Error ? error.stack : undefined,
         force,
@@ -793,11 +797,11 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
         sinceId
       })
       // Remove from loaded set on error so we can retry
-      loadedMessagesRef.current.delete(chatId)
+      loadedMessagesRef.current.delete(chatKey)
       // Don't re-throw - let the UI handle empty messages gracefully
       // But log the error clearly so it's visible in console
     } finally {
-      loadingMessagesRef.current.delete(chatId)
+      loadingMessagesRef.current.delete(chatKey)
     }
   }, []) // Stable - no dependencies to avoid infinite loops
 
@@ -1022,6 +1026,11 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
 
   const sendMessage = useCallback(async (chatId: string, message: string, senderId: number) => {
     if (!userId) return
+    const chatIdNum = normalizeChatIdNumber(chatId)
+    if (chatIdNum === null || chatIdNum <= 0) {
+      console.error('[ChatContext] sendMessage: Invalid chatId', { chatId })
+      return
+    }
 
     const messageText = message.trim()
     if (!messageText) return
@@ -1045,7 +1054,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     const tempMessageId = -Date.now() // Negative ID for temp messages
     const tempMessage: Message = {
       id: tempMessageId,
-      chat_id: parseInt(chatId),
+      chat_id: chatIdNum,
       sender_id: userId,
       sender_type: senderType,
       operator_id: senderType === "operator" ? userId : null,
@@ -1076,7 +1085,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       // Always use REST API to ensure message is saved to database
       // WebSocket will receive the message via real-time update and replace temp message
       // senderType is already determined above
-      const messageId = await apiSendMessage(parseInt(chatId), userId, messageText, senderType)
+      const messageId = await apiSendMessage(chatIdNum, userId, messageText, senderType)
       
       console.log('[ChatContext] sendMessage: Message sent successfully:', {
         messageId,
@@ -1111,7 +1120,12 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
 
   const closeChat = useCallback(async (chatId: string) => {
     try {
-      await apiCloseChat(parseInt(chatId))
+      const chatIdNum = normalizeChatIdNumber(chatId)
+      if (chatIdNum === null || chatIdNum <= 0) {
+        console.error('[ChatContext] closeChat: Invalid chatId', { chatId })
+        return
+      }
+      await apiCloseChat(chatIdNum)
       
       // Close WebSocket connection
       const ws = wsConnections.current.get(chatId)
@@ -1180,10 +1194,15 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
   }, []) // Stable
 
   const addToActiveChats = useCallback((chatId: string) => {
-    console.log('[ChatContext] addToActiveChats: Called with chatId:', chatId, 'userId:', userId, 'userRole:', userRole, 'subscribedChats:', Array.from(subscribedChatIdsRef.current))
+    const normalized = normalizeChatId(chatId)
+    if (!normalized) {
+      console.warn('[ChatContext] addToActiveChats: Invalid chatId', { chatId })
+      return
+    }
+    console.log('[ChatContext] addToActiveChats: Called with chatId:', normalized, 'userId:', userId, 'userRole:', userRole, 'subscribedChats:', Array.from(subscribedChatIdsRef.current))
     // Always add to activeChats - this ensures retry mechanism can find it
     setActiveChats((prev) => {
-      const updated = [...prev.filter((id) => id !== chatId), chatId]
+      const updated = [...prev.filter((id) => id !== normalized), normalized]
       console.log('[ChatContext] addToActiveChats: Updated activeChats:', updated)
       return updated
     })
@@ -1191,17 +1210,17 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     // Initialize WebSocket if not already connected to this chat
     // Allow multiple WebSocket connections for operators (they can have multiple chats)
     // IMPORTANT: For clients, userId must be available - if not, we'll retry when userId is set
-    if (userId && !subscribedChatIdsRef.current.has(chatId)) {
-      console.log('[ChatContext] addToActiveChats: userId available, initializing WebSocket for chat:', chatId, 'userId:', userId, 'userRole:', userRole)
+    if (userId && !subscribedChatIdsRef.current.has(normalized)) {
+      console.log('[ChatContext] addToActiveChats: userId available, initializing WebSocket for chat:', normalized, 'userId:', userId, 'userRole:', userRole)
       // Use initializeWebSocket directly (not via ref) to ensure it's called
-      initializeWebSocket(chatId, userId)
+      initializeWebSocket(normalized, userId)
     } else if (!userId) {
-      console.warn('[ChatContext] addToActiveChats: userId not available yet. Chat added to activeChats, will retry when userId is available. chatId:', chatId, 'userRole:', userRole)
+      console.warn('[ChatContext] addToActiveChats: userId not available yet. Chat added to activeChats, will retry when userId is available. chatId:', normalized, 'userRole:', userRole)
       // Store chatId to retry WebSocket connection when userId becomes available
       // This will be handled by the useEffect that depends on userId
       // For clients, this is critical - WebSocket must be connected to receive messages
     } else {
-      console.log('[ChatContext] addToActiveChats: WebSocket already connected for chat:', chatId, 'userId:', userId)
+      console.log('[ChatContext] addToActiveChats: WebSocket already connected for chat:', normalized, 'userId:', userId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId, userRole, initializeWebSocket]) // Include initializeWebSocket in deps

@@ -1,10 +1,11 @@
 "use client"
 
-import { useState, useEffect, useMemo } from "react"
+import { useState, useEffect, useMemo, useCallback } from "react"
 import { useChat } from "../../context/ChatContext"
 import ChatWindow from "../shared/ChatWindow"
 import ChatList from "../shared/ChatList"
 import { assignChat, type DatabaseUser } from "../../lib/api"
+import { normalizeChatId } from "@/utils/chatId"
 
 interface TelegramUser {
   first_name: string
@@ -47,6 +48,15 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
   const [selectedOperatorId, setSelectedOperatorId] = useState<number | null>(null)
   const [hasLoadedInitial, setHasLoadedInitial] = useState(false)
   const [showNewStaffChatModal, setShowNewStaffChatModal] = useState(false)
+
+  const selectChat = useCallback((rawChatId: string) => {
+    const normalized = normalizeChatId(rawChatId)
+    if (!normalized) {
+      console.warn("[SupervisorDashboard] Invalid chatId received", { rawChatId })
+      return
+    }
+    setSelectedChatId(normalized)
+  }, [])
 
   // Yangi chatlar = faqat client yozganlari (operatorga yuborilmagan)
   // Agar operator_id yo'q bo'lsa va status active bo'lsa, bu yangi chat
@@ -110,16 +120,17 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
     if (!setOnNewMessage) return
     
     setOnNewMessage((chatId: string) => {
-      // Only auto-open if no chat is currently selected
-      if (!selectedChatId) {
-        // Check if this is a new chat (no operator assigned) or active chat
-        const chat = chatSessions.find((c) => c.id === chatId)
-        if (chat) {
-          // For supervisors, auto-open new chats (inbox) or active chats
-          if (!chat.operatorId || chat.status === "active") {
-            setSelectedChatId(chatId)
-          }
-        }
+      if (selectedChatId) {
+        return
+      }
+      const normalized = normalizeChatId(chatId)
+      if (!normalized) {
+        console.warn("[SupervisorDashboard] setOnNewMessage: Invalid chatId", { chatId })
+        return
+      }
+      const chat = chatSessions.find((c) => c.id === normalized)
+      if (chat && (!chat.operatorId || chat.status === "active")) {
+        selectChat(normalized)
       }
     })
     
@@ -522,7 +533,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                                   </span>
                                   <div className="flex items-center space-x-2">
                                     <button
-                                      onClick={() => setSelectedChatId(chat.id)}
+                                      onClick={() => selectChat(chat.id)}
                                       className="px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-lg text-xs font-medium transition-colors bg-blue-100 text-blue-700 hover:bg-blue-200 active:bg-blue-300 touch-manipulation min-h-[44px]"
                                     >
                                       Ko'rish
@@ -572,7 +583,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                         return (
                           <div
                             key={chat.id}
-                            onClick={() => setSelectedChatId(chat.id)}
+                            onClick={() => selectChat(chat.id)}
                             className="p-3 sm:p-4 rounded-xl cursor-pointer transition-all duration-200 transform active:scale-[0.98] hover:scale-[1.02] hover:shadow-lg bg-white hover:bg-blue-50 active:bg-blue-100 border border-blue-200 animate-slide-in touch-manipulation"
                             style={{ animationDelay: `${index * 100}ms`, touchAction: "manipulation" }}
                           >
@@ -634,7 +645,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                     <ChatList
                       chats={allChats}
                       users={users}
-                      onChatSelect={setSelectedChatId}
+                      onChatSelect={selectChat}
                       isDarkMode={false}
                       currentUserId={dbUser?.id || user.id}
                       showOpenButton={false}
@@ -675,7 +686,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                     <ChatList
                       chats={staffChats}
                       users={users}
-                      onChatSelect={setSelectedChatId}
+                      onChatSelect={selectChat}
                       isDarkMode={false}
                       currentUserId={dbUser?.id || user.id}
                       showOpenButton={false}
@@ -730,7 +741,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                                 const chatId = await startStaffChat(staff.id)
                                 console.log('[SupervisorDashboard] Staff chat created:', chatId)
                                 if (chatId) {
-                                  setSelectedChatId(chatId)
+                                  selectChat(chatId)
                                   setShowNewStaffChatModal(false)
                                 } else {
                                   console.error('[SupervisorDashboard] Failed to create staff chat - chatId is null')
