@@ -1,6 +1,7 @@
 """
 Windows uchun main script
 Bu fayl Windows operatsion tizimida ishlatish uchun optimallashtirilgan.
+Ngrok integratsiyasi qo'shilgan - avtomatik HTTPS tunnel yaratadi.
 """
 import asyncio
 import sys
@@ -21,6 +22,17 @@ from utils.directory_utils import setup_media_structure, setup_static_structure
 
 # Logger'ni olish (avval yaratish kerak)
 logger = logging.getLogger(__name__)
+
+# ============================================
+# NGROK CONFIGURATION
+# ============================================
+NGROK_AUTHTOKEN = "350nMzK4nfSGrIzUt2c6pagvoJk_3N3BEX5zjSDUpAgQeU9Hb"
+NGROK_ENABLED = True  # Ngrok'ni yoqish/o'chirish
+
+# Global ngrok process reference
+ngrok_process = None
+ngrok_backend_url = None  # Backend (API) uchun ngrok URL
+ngrok_frontend_url = None  # Frontend (WebApp) uchun ngrok URL
 
 # Konfiguratsiya (.env orqali)
 API_PORT = settings.API_PORT
@@ -78,6 +90,149 @@ except Exception as e:
     logger.exception("Directory setup failed", exc_info=True)
     sys.exit(1)
 
+def run_ngrok_tunnels() -> tuple[str | None, str | None]:
+    """
+    Ngrok tunnels ishga tushirish - backend va frontend uchun.
+    
+    Returns:
+        Tuple (backend_url, frontend_url) yoki (None, None)
+    """
+    global ngrok_process, ngrok_backend_url, ngrok_frontend_url
+    
+    if not NGROK_ENABLED:
+        logger.info("Ngrok is disabled. Skipping tunnel creation.")
+        return None, None
+    
+    try:
+        # Avval mavjud ngrok jarayonlarini to'xtatish
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "ngrok.exe"],
+                capture_output=True,
+                shell=True,
+                timeout=5
+            )
+            time.sleep(2)
+        except Exception:
+            pass  # Agar ngrok ishlamayotgan bo'lsa, xato bo'ladi - bu normal
+        
+        # Ngrok config fayli yo'lini olish
+        current_dir = Path(__file__).parent.absolute()
+        ngrok_config_path = current_dir / "ngrok.yml"
+        
+        if not ngrok_config_path.exists():
+            logger.error(f"❌ Ngrok config file not found: {ngrok_config_path}")
+            return None, None
+        
+        # Ngrok tunnels ishga tushirish (config fayli orqali)
+        logger.info(f"Starting ngrok tunnels from config: {ngrok_config_path}")
+        ngrok_process = subprocess.Popen(
+            ["ngrok", "start", "--all", "--config", str(ngrok_config_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            shell=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        running_processes.append(ngrok_process)
+        
+        # Ngrok URL larni olish uchun kutish (API orqali)
+        logger.info("Waiting for ngrok tunnels to start...")
+        time.sleep(5)  # Ngrok ishga tushishi uchun kutish
+        
+        # Ngrok API orqali URL larni olish
+        try:
+            import urllib.request
+            import json
+            
+            # Ngrok local API
+            api_url = "http://127.0.0.1:4040/api/tunnels"
+            
+            backend_url = None
+            frontend_url = None
+            
+            for attempt in range(10):
+                try:
+                    with urllib.request.urlopen(api_url, timeout=5) as response:
+                        data = json.loads(response.read().decode())
+                        tunnels = data.get("tunnels", [])
+                        
+                        for tunnel in tunnels:
+                            public_url = tunnel.get("public_url", "")
+                            tunnel_name = tunnel.get("name", "")
+                            tunnel_config = tunnel.get("config", {})
+                            tunnel_addr = tunnel_config.get("addr", "")
+                            
+                            if not public_url.startswith("https://"):
+                                continue
+                            
+                            # Tunnel portiga qarab aniqlash
+                            if ":8001" in tunnel_addr or tunnel_name == "backend":
+                                backend_url = public_url
+                                logger.info(f"✅ Backend tunnel: {backend_url}")
+                            elif ":3200" in tunnel_addr or tunnel_name == "frontend":
+                                frontend_url = public_url
+                                logger.info(f"✅ Frontend tunnel: {frontend_url}")
+                        
+                        if backend_url and frontend_url:
+                            ngrok_backend_url = backend_url
+                            ngrok_frontend_url = frontend_url
+                            return backend_url, frontend_url
+                            
+                except Exception as e:
+                    logger.debug(f"Ngrok API attempt {attempt + 1} failed: {e}")
+                
+                time.sleep(2)
+            
+            # Agar hech bo'lmaganda bitta URL topilsa
+            if backend_url or frontend_url:
+                ngrok_backend_url = backend_url
+                ngrok_frontend_url = frontend_url
+                return backend_url, frontend_url
+            
+            logger.warning("Could not get ngrok URLs from API")
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"Error getting ngrok URLs: {e}")
+            return None, None
+            
+    except FileNotFoundError:
+        logger.error("❌ Ngrok is not installed or not in PATH!")
+        logger.error("   Please install ngrok: https://ngrok.com/download")
+        return None, None
+    except Exception as e:
+        logger.error(f"Error starting ngrok tunnels: {e}")
+        return None, None
+
+
+def stop_ngrok_tunnels():
+    """Ngrok tunnels'ni to'xtatish"""
+    global ngrok_process, ngrok_backend_url, ngrok_frontend_url
+    
+    try:
+        if ngrok_process and ngrok_process.poll() is None:
+            logger.info("Stopping ngrok tunnels...")
+            ngrok_process.terminate()
+            time.sleep(1)
+            if ngrok_process.poll() is None:
+                ngrok_process.kill()
+        
+        # Barcha ngrok jarayonlarini to'xtatish
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "ngrok.exe"],
+            capture_output=True,
+            shell=True
+        )
+        
+        ngrok_process = None
+        ngrok_backend_url = None
+        ngrok_frontend_url = None
+        logger.info("Ngrok tunnels stopped")
+    except Exception as e:
+        logger.warning(f"Error stopping ngrok: {e}")
+
+
 def run_api_server():
     """Run FastAPI server in a background process"""
     global running_processes
@@ -120,6 +275,11 @@ def run_api_server():
 def cleanup_processes():
     """Cleanup all processes and threads on exit (Windows specific)"""
     global running_processes
+    
+    # Ngrok'ni to'xtatish
+    if NGROK_ENABLED:
+        stop_ngrok_tunnels()
+    
     if not running_processes:
         return
     
@@ -380,6 +540,8 @@ def run_webapp_server():
 
 
 async def main():
+    global ngrok_backend_url, ngrok_frontend_url, BACKEND_HTTP_URL, BACKEND_WS_URL, WEBAPP_URL
+    
     # Windows uchun lokal IP ni ko'rsatish
     local_ip = get_local_ip_windows()
     logger.info("=" * 60)
@@ -401,11 +563,62 @@ async def main():
     if not api_process:
         logger.error("Failed to start FastAPI server. Exiting.")
         return
-
-    # Start Next.js webapp server in background process
+    
+    # Start Next.js webapp server in background process (NGROK'dan OLDIN!)
     webapp_process = run_webapp_server()
     if not webapp_process:
         logger.warning("Next.js webapp server not started. Please start it manually if needed.")
+    
+    # ============================================
+    # NGROK TUNNELS SETUP (Backend + Frontend)
+    # ============================================
+    if NGROK_ENABLED:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("🌐 Setting up Ngrok Tunnels (Backend + Frontend)...")
+        logger.info("=" * 60)
+        
+        # Servers tayyor bo'lishi uchun kutish
+        logger.info("Waiting for servers to be ready...")
+        time.sleep(5)
+        
+        # Ngrok tunnels ishga tushirish
+        backend_url, frontend_url = run_ngrok_tunnels()
+        
+        if backend_url or frontend_url:
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("✅ NGROK TUNNELS READY!")
+            logger.info("=" * 60)
+            
+            if backend_url:
+                ngrok_backend_url = backend_url
+                BACKEND_HTTP_URL = backend_url
+                BACKEND_WS_URL = backend_url.replace("https://", "wss://")
+                logger.info(f"🔗 Backend API:  {BACKEND_HTTP_URL}")
+                logger.info(f"🔗 Backend WS:   {BACKEND_WS_URL}")
+            
+            if frontend_url:
+                ngrok_frontend_url = frontend_url
+                WEBAPP_URL = frontend_url
+                # Settings'ni ham yangilash (keyboards uchun)
+                settings.WEBAPP_URL = frontend_url
+                logger.info(f"🔗 Frontend URL: {WEBAPP_URL}")
+            
+            logger.info("")
+            logger.info("📋 Telegram Bot uchun:")
+            logger.info(f"   - WebApp URL: {WEBAPP_URL}")
+            logger.info(f"   - API URL:    {BACKEND_HTTP_URL}")
+            logger.info("")
+            logger.info("🌐 Browserda ochish uchun:")
+            logger.info(f"   - WebApp: {WEBAPP_URL}")
+            logger.info(f"   - API Docs: {BACKEND_HTTP_URL}/docs")
+            logger.info("=" * 60)
+            logger.info("")
+        else:
+            logger.warning("⚠️ Ngrok tunnels could not be created. Using local URLs.")
+    else:
+        logger.info("ℹ️ Ngrok is disabled. Using local URLs only.")
     
     # Server qayta ishga tushganda material recovery
     try:

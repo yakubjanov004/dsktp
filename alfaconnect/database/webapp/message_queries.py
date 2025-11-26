@@ -15,21 +15,44 @@ async def create_message(
     operator_id: Optional[int] = None,
     attachments: Optional[Dict[str, Any]] = None
 ) -> int:
-    """Create a new message"""
+    """
+    Create a new message and update chat's last_activity_at.
+    
+    This is an atomic operation - both message creation and activity update
+    happen in the same transaction.
+    """
     conn = await asyncpg.connect(settings.DB_URL)
     try:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO messages (
-                chat_id, sender_id, sender_type, operator_id, message_text, attachments
+        # Transaction ichida xabar yaratish va chat activity yangilash
+        async with conn.transaction():
+            # 1. Xabar yaratish
+            row = await conn.fetchrow(
+                """
+                INSERT INTO messages (
+                    chat_id, sender_id, sender_type, operator_id, message_text, attachments
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
+                """,
+                chat_id, sender_id, sender_type, operator_id, message_text,
+                asyncpg.types.pgjsonb.encode(attachments) if attachments else None
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-            """,
-            chat_id, sender_id, sender_type, operator_id, message_text,
-            asyncpg.types.pgjsonb.encode(attachments) if attachments else None
-        )
-        return row['id'] if row else None
+            
+            message_id = row['id'] if row else None
+            
+            if message_id:
+                # 2. Chat last_activity_at ni yangilash (har bir xabar yuborilganda!)
+                await conn.execute(
+                    """
+                    UPDATE chats
+                    SET last_activity_at = now(),
+                        updated_at = now()
+                    WHERE id = $1
+                    """,
+                    chat_id
+                )
+            
+            return message_id
     finally:
         await conn.close()
 

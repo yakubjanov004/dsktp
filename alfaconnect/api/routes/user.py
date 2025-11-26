@@ -222,15 +222,30 @@ async def list_clients(
     offset: int = Query(0, ge=0, description="Offset for pagination")
 ):
     """
-    Get list of available clients (for operators)
+    Get list of available clients (for operators).
+    Includes is_online and last_seen_at for presence tracking.
     """
     try:
+        from database.webapp.user_status_queries import is_user_online
+        
         clients = await get_available_clients(limit=limit, offset=offset)
         
-        # Convert datetime objects to strings
+        # Convert datetime objects to strings and calculate is_online
         for client in clients:
             if client.get('created_at'):
                 client['created_at'] = client['created_at'].isoformat()
+            if client.get('updated_at'):
+                client['updated_at'] = client['updated_at'].isoformat()
+            
+            # Calculate is_online from last_seen_at using TTL
+            last_seen_at = client.get('last_seen_at')
+            if last_seen_at and hasattr(last_seen_at, 'isoformat'):
+                client['last_seen_at'] = last_seen_at.isoformat()
+                client['is_online'] = is_user_online(last_seen_at)
+            else:
+                client['is_online'] = False
+                if last_seen_at:
+                    client['last_seen_at'] = last_seen_at.isoformat() if hasattr(last_seen_at, 'isoformat') else last_seen_at
         
         return {"clients": clients, "count": len(clients)}
     except Exception as e:
@@ -243,18 +258,33 @@ async def search_clients_endpoint(
     limit: int = Query(20, ge=1, le=100, description="Maximum number of results")
 ):
     """
-    Search clients by name, phone, or abonent_id
+    Search clients by name, phone, or abonent_id.
+    Includes is_online and last_seen_at for presence tracking.
     """
     try:
+        from database.webapp.user_status_queries import is_user_online
+        
         if len(q) < 2:
             return {"clients": [], "count": 0}
         
         clients = await search_clients(q, limit=limit)
         
-        # Convert datetime objects to strings
+        # Convert datetime objects to strings and calculate is_online
         for client in clients:
             if client.get('created_at'):
                 client['created_at'] = client['created_at'].isoformat()
+            if client.get('updated_at'):
+                client['updated_at'] = client['updated_at'].isoformat()
+            
+            # Calculate is_online from last_seen_at using TTL
+            last_seen_at = client.get('last_seen_at')
+            if last_seen_at and hasattr(last_seen_at, 'isoformat'):
+                client['last_seen_at'] = last_seen_at.isoformat()
+                client['is_online'] = is_user_online(last_seen_at)
+            else:
+                client['is_online'] = False
+                if last_seen_at:
+                    client['last_seen_at'] = last_seen_at.isoformat() if hasattr(last_seen_at, 'isoformat') else last_seen_at
         
         return {"clients": clients, "count": len(clients)}
     except Exception as e:
@@ -431,3 +461,71 @@ async def update_user_status(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating user status: {str(e)}")
+
+
+@router.post("/status/dev", status_code=status.HTTP_200_OK)
+async def update_user_status_dev(
+    request: UpdateStatusRequest,
+    telegram_id: int = Query(..., description="Telegram user ID for dev mode")
+):
+    """
+    🛠️ DEV ONLY: Update user online status without Telegram initData.
+    
+    This endpoint is for development/testing when running outside Telegram WebApp.
+    Uses telegram_id query param instead of initData header.
+    
+    ⚠️ WARNING: This should be disabled or protected in production!
+    """
+    import os
+    
+    # Only allow in development mode (optional security check)
+    # In production, you might want to disable this endpoint entirely
+    # or add additional authentication
+    
+    try:
+        # Get user by telegram_id
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User not found for telegram_id: {telegram_id}")
+        
+        user_id = user.get('id')
+        user_role = user.get('role')
+        now = datetime.now(timezone.utc)
+        
+        is_online = request.is_online
+        
+        # Update both last_seen_at and is_online in database
+        success = await update_user_last_seen(
+            user_id=user_id,
+            last_seen_at=now,
+            is_online=is_online
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update user status in database")
+        
+        # Update in-memory presence tracking (used by WebSocket system)
+        try:
+            from api.routes.websocket import online_users, online_status_timestamp, broadcast_user_status
+            online_users[user_id] = is_online
+            online_status_timestamp[user_id] = now
+            
+            # Broadcast status change to other users via WebSocket
+            await broadcast_user_status(user_id, is_online, user_role)
+        except Exception as ws_error:
+            import logging
+            logging.warning(f"[DEV] WebSocket broadcast failed: {ws_error}")
+        
+        return {
+            "status": "success",
+            "is_online": is_online,
+            "user_id": user_id,
+            "telegram_id": telegram_id,
+            "last_seen_at": now.isoformat(),
+            "timestamp": now.isoformat(),
+            "mode": "dev"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating user status (dev): {str(e)}")

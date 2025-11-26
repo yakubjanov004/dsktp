@@ -177,303 +177,8 @@ async def create_new_chat(request: CreateChatRequest):
         raise HTTPException(status_code=500, detail=f"Error creating chat: {str(e)}")
 
 
-@router.get("/{chat_id}")
-async def get_chat(chat_id: int):
-    """
-    Get chat by ID
-    """
-    try:
-        chat = await get_chat_by_id(chat_id)
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        # Convert datetime objects to strings
-        if chat.get('created_at'):
-            chat['created_at'] = chat['created_at'].isoformat()
-        if chat.get('updated_at'):
-            chat['updated_at'] = chat['updated_at'].isoformat()
-        if chat.get('last_activity_at'):
-            chat['last_activity_at'] = chat['last_activity_at'].isoformat()
-        
-        return chat
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching chat: {str(e)}")
-
-
-@router.get("/{chat_id}/messages")
-async def get_messages(
-    chat_id: int,
-    limit: int = Query(100, ge=1, le=200, description="Maximum number of messages"),
-    offset: int = Query(0, ge=0, description="Offset for pagination (used if cursor not provided)"),
-    cursor_ts: Optional[str] = Query(None, description="Cursor timestamp (ISO format)"),
-    cursor_id: Optional[int] = Query(None, description="Cursor message ID"),
-    since_ts: Optional[str] = Query(None, description="Get messages after this timestamp (ISO format)"),
-    since_id: Optional[int] = Query(None, description="Get messages after this message ID"),
-    all_messages: bool = Query(False, description="Return all messages in chronological order (for supervisors)")
-):
-    """
-    Get messages for a chat with cursor-based pagination (preferred) or offset pagination (fallback)
-    If all_messages=true, returns ALL messages in chronological order (oldest first)
-    Supports since_ts/since_id for syncing messages after reconnect
-    """
-    try:
-        print(f"[API] /chat/{chat_id}/messages: Request received", {
-            "chat_id": chat_id,
-            "limit": limit,
-            "offset": offset,
-            "cursor_ts": cursor_ts,
-            "cursor_id": cursor_id,
-            "since_ts": since_ts,
-            "since_id": since_id,
-            "all_messages": all_messages
-        })
-        
-        # Verify chat exists
-        chat = await get_chat_by_id(chat_id)
-        if not chat:
-            print(f"[API] /chat/{chat_id}/messages: Chat not found")
-            raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
-        
-        print(f"[API] /chat/{chat_id}/messages: Chat found", {
-            "chat_id": chat.get('id'),
-            "client_id": chat.get('client_id'),
-            "operator_id": chat.get('operator_id'),
-            "status": chat.get('status')
-        })
-        
-        cursor_timestamp = None
-        if cursor_ts:
-            try:
-                cursor_timestamp = datetime.fromisoformat(cursor_ts.replace('Z', '+00:00'))
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid cursor_ts format. Use ISO format.")
-        
-        since_timestamp = None
-        if since_ts:
-            try:
-                since_timestamp = datetime.fromisoformat(since_ts.replace('Z', '+00:00'))
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid since_ts format. Use ISO format.")
-        
-        print(f"[API] /chat/{chat_id}/messages: Calling get_chat_messages", {
-            "chat_id": chat_id,
-            "limit": limit,
-            "offset": offset,
-            "all_messages": all_messages
-        })
-        
-        messages = await get_chat_messages(
-            chat_id, 
-            limit=limit, 
-            offset=offset,
-            cursor_ts=cursor_timestamp,
-            cursor_id=cursor_id,
-            since_ts=since_timestamp,
-            since_id=since_id,
-            all_messages=all_messages
-        )
-        
-        print(f"[API] /chat/{chat_id}/messages: Retrieved {len(messages)} messages from database")
-        
-        # Convert datetime objects to strings
-        for message in messages:
-            if message.get('created_at'):
-                message['created_at'] = message['created_at'].isoformat()
-        
-        print(f"[API] /chat/{chat_id}/messages: Returning {len(messages)} messages")
-        
-        return {"messages": messages, "count": len(messages)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[API] /chat/{chat_id}/messages: Error occurred", {
-            "chat_id": chat_id,
-            "error": str(e),
-            "error_type": type(e).__name__
-        })
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching messages: {str(e)}")
-
-
-@router.post("/{chat_id}/messages")
-async def send_message(chat_id: int, request: SendMessageRequest):
-    """
-    Send a message in a chat.
-    Messages are immutable (no updates/deletes allowed per schema).
-    Chat activity is automatically updated by trigger.
-    """
-    try:
-        # Verify chat exists
-        chat = await get_chat_by_id(chat_id)
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        # Verify sender is participant
-        client_id = chat.get('client_id')
-        operator_id = chat.get('operator_id')
-        
-        # Allow client or operator to send messages
-        allowed_users = [client_id]
-        if operator_id:
-            allowed_users.append(operator_id)
-        
-        if request.sender_id not in allowed_users:
-            raise HTTPException(status_code=403, detail="User is not a participant in this chat")
-        
-        # Validate message text (required per new schema)
-        if not request.message_text or not request.message_text.strip():
-            raise HTTPException(status_code=400, detail="Message text cannot be empty")
-        
-        # Validate sender_type
-        if request.sender_type not in ('client', 'operator', 'system'):
-            raise HTTPException(status_code=400, detail="Invalid sender_type. Must be 'client', 'operator', or 'system'")
-        
-        # Determine operator_id and sender_id based on sender_type
-        # GOTCHA: Operator messages must have operator_id = sender_id
-        # GOTCHA: System messages must have sender_id = NULL and operator_id = NULL
-        operator_id_for_message = None
-        sender_id_for_message = request.sender_id
-        
-        if request.sender_type == 'operator':
-            # For operator messages, operator_id must match sender_id (CHECK constraint requirement)
-            if request.operator_id and request.operator_id != request.sender_id:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="operator_id must match sender_id for operator messages (gotcha: CHECK constraint requirement)"
-                )
-            operator_id_for_message = request.sender_id
-        elif request.sender_type == 'system':
-            # System messages: sender_id must be NULL (CHECK constraint requirement)
-            # GOTCHA: System messages don't reactivate chat (trigger logic)
-            sender_id_for_message = None
-            operator_id_for_message = None
-        # For client messages, operator_id is NULL
-        
-        message_id = await create_message(
-            chat_id=chat_id,
-            sender_id=sender_id_for_message,
-            message_text=request.message_text.strip(),
-            sender_type=request.sender_type,
-            operator_id=operator_id_for_message,
-            attachments=request.attachments
-        )
-        
-        if not message_id:
-            raise HTTPException(status_code=500, detail="Failed to create message - no ID returned")
-        
-        # Send WebSocket event to all connected clients (both old and new endpoints)
-        message = await get_message_by_id(message_id)
-        if message:
-            from api.routes.websocket import send_chat_message_event
-            await send_chat_message_event(chat_id, message)
-        
-        return {"message_id": message_id, "status": "sent"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
-
-
-@router.put("/{chat_id}/close")
-async def close_chat_endpoint(chat_id: int):
-    """
-    Mark chat as inactive (chats cannot be deleted per schema rules).
-    This sets status='inactive' and operator_id=NULL.
-    """
-    try:
-        success = await close_chat(chat_id)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to close chat")
-        
-        # Send WebSocket event with updated chat payload
-        updated_chat = await get_chat_by_id(chat_id)
-        await send_chat_inactive_event(chat_id, updated_chat)
-        
-        # Update stats
-        stats = await get_active_chat_counts()
-        from api.routes.websocket import send_stats_changed_event
-        await send_stats_changed_event(stats['inbox_count'], stats['operator_counts'])
-        
-        return {"status": "inactive", "chat_id": chat_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error closing chat: {str(e)}")
-
-
-@router.put("/{chat_id}/assign")
-async def assign_chat(chat_id: int, request: AssignChatRequest):
-    """
-    Assign chat to operator with race condition check.
-    Returns 409 if chat already assigned (race condition).
-    Sends WebSocket events: chat.assigned, chat.operator_changed (if operator changed), and stats.changed
-    """
-    try:
-        # Get current chat info to check if operator is changing
-        chat = await get_chat_by_id(chat_id)
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        old_operator_id = chat.get('operator_id')
-        
-        success = await assign_chat_to_operator(chat_id, request.operator_id)
-        if not success:
-            # Chat already assigned by another supervisor (race condition)
-            # Track conflict for monitoring
-            from utils.monitoring import track_db_conflict
-            await track_db_conflict("ux_chat_assignment_log_chat_open")
-            raise HTTPException(
-                status_code=409, 
-                detail="Chat already assigned to another operator (race condition detected)"
-            )
-        
-        # Send WebSocket events with updated chat payload
-        updated_chat = await get_chat_by_id(chat_id)
-        await send_chat_assigned_event(chat_id, request.operator_id, updated_chat)
-        
-        
-        # Update stats and send stats.changed event
-        stats = await get_active_chat_counts()
-        await send_stats_changed_event(stats['inbox_count'], stats['operator_counts'])
-        
-        return {"status": "assigned", "chat_id": chat_id, "operator_id": request.operator_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error assigning chat: {str(e)}")
-
-
-@router.get("/{chat_id}/client-info")
-async def get_client_info_for_chat(chat_id: int):
-    """
-    Get client info for a chat (for operators)
-    """
-    try:
-        chat = await get_chat_by_id(chat_id)
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        client_id = chat.get('client_id')
-        from database.webapp.user_queries import get_client_info
-        
-        client_info = await get_client_info(client_id)
-        if not client_info:
-            raise HTTPException(status_code=404, detail="Client not found")
-        
-        # Convert datetime objects to strings
-        if client_info.get('created_at'):
-            client_info['created_at'] = client_info['created_at'].isoformat()
-        if client_info.get('updated_at'):
-            client_info['updated_at'] = client_info['updated_at'].isoformat()
-        
-        return client_info
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching client info: {str(e)}")
+# NOTE: /{chat_id} endpoints are placed AFTER static paths (/inbox, /active, /my, /stats/*, /mark-inactive)
+# to avoid FastAPI routing conflicts. See section "DYNAMIC CHAT ID ENDPOINTS" below.
 
 
 @router.get("/stats/active-count")
@@ -711,6 +416,311 @@ async def mark_inactive_chats_endpoint():
         execution_time = time.time() - start_time
         await log_mark_inactive_result(0, execution_time)
         raise HTTPException(status_code=500, detail=f"Error marking inactive chats: {str(e)}")
+
+
+# ============================================
+# DYNAMIC CHAT ID ENDPOINTS
+# NOTE: These endpoints use path parameter {chat_id} and MUST be placed
+# AFTER all static paths (/inbox, /active, /my, /stats/*, /mark-inactive)
+# to avoid FastAPI routing conflicts where "inbox" would be parsed as chat_id.
+# ============================================
+
+@router.get("/{chat_id}")
+async def get_chat_by_id_endpoint(chat_id: int):
+    """
+    Get chat by ID
+    """
+    try:
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Convert datetime objects to strings
+        if chat.get('created_at'):
+            chat['created_at'] = chat['created_at'].isoformat()
+        if chat.get('updated_at'):
+            chat['updated_at'] = chat['updated_at'].isoformat()
+        if chat.get('last_activity_at'):
+            chat['last_activity_at'] = chat['last_activity_at'].isoformat()
+        
+        return chat
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching chat: {str(e)}")
+
+
+@router.get("/{chat_id}/messages")
+async def get_chat_messages_endpoint(
+    chat_id: int,
+    limit: int = Query(100, ge=1, le=200, description="Maximum number of messages"),
+    offset: int = Query(0, ge=0, description="Offset for pagination (used if cursor not provided)"),
+    cursor_ts: Optional[str] = Query(None, description="Cursor timestamp (ISO format)"),
+    cursor_id: Optional[int] = Query(None, description="Cursor message ID"),
+    since_ts: Optional[str] = Query(None, description="Get messages after this timestamp (ISO format)"),
+    since_id: Optional[int] = Query(None, description="Get messages after this message ID"),
+    all_messages: bool = Query(False, description="Return all messages in chronological order (for supervisors)")
+):
+    """
+    Get messages for a chat with cursor-based pagination (preferred) or offset pagination (fallback)
+    If all_messages=true, returns ALL messages in chronological order (oldest first)
+    Supports since_ts/since_id for syncing messages after reconnect
+    """
+    try:
+        print(f"[API] /chat/{chat_id}/messages: Request received", {
+            "chat_id": chat_id,
+            "limit": limit,
+            "offset": offset,
+            "cursor_ts": cursor_ts,
+            "cursor_id": cursor_id,
+            "since_ts": since_ts,
+            "since_id": since_id,
+            "all_messages": all_messages
+        })
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            print(f"[API] /chat/{chat_id}/messages: Chat not found")
+            raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
+        
+        print(f"[API] /chat/{chat_id}/messages: Chat found", {
+            "chat_id": chat.get('id'),
+            "client_id": chat.get('client_id'),
+            "operator_id": chat.get('operator_id'),
+            "status": chat.get('status')
+        })
+        
+        cursor_timestamp = None
+        if cursor_ts:
+            try:
+                cursor_timestamp = datetime.fromisoformat(cursor_ts.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid cursor_ts format. Use ISO format.")
+        
+        since_timestamp = None
+        if since_ts:
+            try:
+                since_timestamp = datetime.fromisoformat(since_ts.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid since_ts format. Use ISO format.")
+        
+        print(f"[API] /chat/{chat_id}/messages: Calling get_chat_messages", {
+            "chat_id": chat_id,
+            "limit": limit,
+            "offset": offset,
+            "all_messages": all_messages
+        })
+        
+        messages = await get_chat_messages(
+            chat_id, 
+            limit=limit, 
+            offset=offset,
+            cursor_ts=cursor_timestamp,
+            cursor_id=cursor_id,
+            since_ts=since_timestamp,
+            since_id=since_id,
+            all_messages=all_messages
+        )
+        
+        print(f"[API] /chat/{chat_id}/messages: Retrieved {len(messages)} messages from database")
+        
+        # Convert datetime objects to strings
+        for message in messages:
+            if message.get('created_at'):
+                message['created_at'] = message['created_at'].isoformat()
+        
+        print(f"[API] /chat/{chat_id}/messages: Returning {len(messages)} messages")
+        
+        return {"messages": messages, "count": len(messages)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] /chat/{chat_id}/messages: Error occurred", {
+            "chat_id": chat_id,
+            "error": str(e),
+            "error_type": type(e).__name__
+        })
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching messages: {str(e)}")
+
+
+@router.post("/{chat_id}/messages")
+async def send_chat_message_endpoint(chat_id: int, request: SendMessageRequest):
+    """
+    Send a message in a chat.
+    Messages are immutable (no updates/deletes allowed per schema).
+    Chat activity is automatically updated by trigger.
+    """
+    try:
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Verify sender is participant
+        client_id = chat.get('client_id')
+        operator_id = chat.get('operator_id')
+        
+        # Allow client or operator to send messages
+        allowed_users = [client_id]
+        if operator_id:
+            allowed_users.append(operator_id)
+        
+        if request.sender_id not in allowed_users:
+            raise HTTPException(status_code=403, detail="User is not a participant in this chat")
+        
+        # Validate message text (required per new schema)
+        if not request.message_text or not request.message_text.strip():
+            raise HTTPException(status_code=400, detail="Message text cannot be empty")
+        
+        # Validate sender_type
+        if request.sender_type not in ('client', 'operator', 'system'):
+            raise HTTPException(status_code=400, detail="Invalid sender_type. Must be 'client', 'operator', or 'system'")
+        
+        # Determine operator_id and sender_id based on sender_type
+        # GOTCHA: Operator messages must have operator_id = sender_id
+        # GOTCHA: System messages must have sender_id = NULL and operator_id = NULL
+        operator_id_for_message = None
+        sender_id_for_message = request.sender_id
+        
+        if request.sender_type == 'operator':
+            # For operator messages, operator_id must match sender_id (CHECK constraint requirement)
+            if request.operator_id and request.operator_id != request.sender_id:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="operator_id must match sender_id for operator messages (gotcha: CHECK constraint requirement)"
+                )
+            operator_id_for_message = request.sender_id
+        elif request.sender_type == 'system':
+            # System messages: sender_id must be NULL (CHECK constraint requirement)
+            # GOTCHA: System messages don't reactivate chat (trigger logic)
+            sender_id_for_message = None
+            operator_id_for_message = None
+        # For client messages, operator_id is NULL
+        
+        message_id = await create_message(
+            chat_id=chat_id,
+            sender_id=sender_id_for_message,
+            message_text=request.message_text.strip(),
+            sender_type=request.sender_type,
+            operator_id=operator_id_for_message,
+            attachments=request.attachments
+        )
+        
+        if not message_id:
+            raise HTTPException(status_code=500, detail="Failed to create message - no ID returned")
+        
+        # Send WebSocket event to all connected clients (both old and new endpoints)
+        message = await get_message_by_id(message_id)
+        if message:
+            from api.routes.websocket import send_chat_message_event
+            await send_chat_message_event(chat_id, message)
+        
+        return {"message_id": message_id, "status": "sent"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
+
+
+@router.put("/{chat_id}/close")
+async def close_chat_by_id_endpoint(chat_id: int):
+    """
+    Mark chat as inactive (chats cannot be deleted per schema rules).
+    This sets status='inactive' and operator_id=NULL.
+    """
+    try:
+        success = await close_chat(chat_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to close chat")
+        
+        # Send WebSocket event with updated chat payload
+        updated_chat = await get_chat_by_id(chat_id)
+        await send_chat_inactive_event(chat_id, updated_chat)
+        
+        # Update stats
+        stats = await get_active_chat_counts()
+        from api.routes.websocket import send_stats_changed_event
+        await send_stats_changed_event(stats['inbox_count'], stats['operator_counts'])
+        
+        return {"status": "inactive", "chat_id": chat_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error closing chat: {str(e)}")
+
+
+@router.put("/{chat_id}/assign")
+async def assign_chat_to_operator_endpoint(chat_id: int, request: AssignChatRequest):
+    """
+    Assign chat to operator with race condition check.
+    Returns 409 if chat already assigned (race condition).
+    Sends WebSocket events: chat.assigned, chat.operator_changed (if operator changed), and stats.changed
+    """
+    try:
+        # Get current chat info to check if operator is changing
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        old_operator_id = chat.get('operator_id')
+        
+        success = await assign_chat_to_operator(chat_id, request.operator_id)
+        if not success:
+            # Chat already assigned by another supervisor (race condition)
+            # Track conflict for monitoring
+            from utils.monitoring import track_db_conflict
+            await track_db_conflict("ux_chat_assignment_log_chat_open")
+            raise HTTPException(
+                status_code=409, 
+                detail="Chat already assigned to another operator (race condition detected)"
+            )
+        
+        # Send WebSocket events with updated chat payload
+        updated_chat = await get_chat_by_id(chat_id)
+        await send_chat_assigned_event(chat_id, request.operator_id, updated_chat)
+        
+        # Update stats and send stats.changed event
+        stats = await get_active_chat_counts()
+        await send_stats_changed_event(stats['inbox_count'], stats['operator_counts'])
+        
+        return {"status": "assigned", "chat_id": chat_id, "operator_id": request.operator_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error assigning chat: {str(e)}")
+
+
+@router.get("/{chat_id}/client-info")
+async def get_chat_client_info_endpoint(chat_id: int):
+    """
+    Get client info for a chat (for operators)
+    """
+    try:
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        client_id = chat.get('client_id')
+        from database.webapp.user_queries import get_client_info
+        
+        client_info = await get_client_info(client_id)
+        if not client_info:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        # Convert datetime objects to strings
+        if client_info.get('created_at'):
+            client_info['created_at'] = client_info['created_at'].isoformat()
+        if client_info.get('updated_at'):
+            client_info['updated_at'] = client_info['updated_at'].isoformat()
+        
+        return client_info
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching client info: {str(e)}")
 
 
 # ============================================
