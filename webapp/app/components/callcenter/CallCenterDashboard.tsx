@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { useChat } from "../../context/ChatContext"
 import ChatList from "../shared/ChatList"
 import ChatWindow from "../shared/ChatWindow"
@@ -8,6 +8,7 @@ import ClosedChats from "../shared/ClosedChats"
 import FloatingActionButton from "./FloatingActionButton"
 import StatisticsModal from "./StatisticsModal"
 import SearchModal from "./SearchModal"
+import { normalizeChatId } from "@/utils/chatId"
 
 interface TelegramUser {
   first_name: string
@@ -57,6 +58,15 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
   const [hasLoadedInitial, setHasLoadedInitial] = useState(false)
   const [showNewStaffChatModal, setShowNewStaffChatModal] = useState(false)
 
+  const selectChat = useCallback((rawChatId: string) => {
+    const normalized = normalizeChatId(rawChatId)
+    if (!normalized) {
+      console.warn("[CallCenterDashboard] Invalid chatId received", { rawChatId })
+      return
+    }
+    setSelectedChatId(normalized)
+  }, [])
+
   // Operator uchun faqat unga yuborilgan chatlar ko'rsatiladi
   const currentUserIdStr = currentUserId.toString()
   
@@ -104,14 +114,17 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
     if (!setOnNewMessage) return
     
     setOnNewMessage((chatId: string) => {
-      // Only auto-open if no chat is currently selected
-      if (!selectedChatId) {
-        // Check if this is a chat assigned to current operator
-        const chat = chatSessions.find((c) => c.id === chatId)
-        if (chat && chat.operatorId === currentUserIdStr) {
-          // This is operator's chat - auto-open it
-          setSelectedChatId(chatId)
-        }
+      if (selectedChatId) {
+        return
+      }
+      const normalized = normalizeChatId(chatId)
+      if (!normalized) {
+        console.warn("[CallCenterDashboard] setOnNewMessage: Received invalid chatId", { chatId })
+        return
+      }
+      const chat = chatSessions.find((c) => c.id === normalized)
+      if (chat && chat.operatorId === currentUserIdStr) {
+        selectChat(normalized)
       }
     })
     
@@ -124,13 +137,17 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
   }, [selectedChatId, currentUserIdStr, setOnNewMessage])
 
   const handleOpenChatWindow = (chatId: string) => {
-    // Chat oynasini to'liq ochish
-    setSelectedChatId(chatId)
-    
-    // Pastki o'ng burchakdagi kichik oynani yopish
-    setOpenChatWindows((prev) => prev.filter((id) => id !== chatId))
+    const normalized = normalizeChatId(chatId)
+    if (!normalized) {
+      console.warn("[CallCenterDashboard] handleOpenChatWindow: Invalid chatId", { chatId })
+      return
+    }
+    selectChat(normalized)
+    setOpenChatWindows((prev) => {
+      const filtered = prev.filter((id) => id !== normalized)
+      return [...filtered, normalized]
+    })
     // DON'T remove from active chats - keep WebSocket connection alive for real-time updates
-    // The chat is still active, just moved to full view
   }
 
   const handleCloseChatWindow = (chatId: string) => {
@@ -486,7 +503,7 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
                                 const chatId = await startStaffChat(staff.id)
                                 console.log('[CallCenterDashboard] Staff chat created:', chatId)
                                 if (chatId) {
-                                  setSelectedChatId(chatId)
+                                  selectChat(chatId)
                                   setShowNewStaffChatModal(false)
                                 } else {
                                   console.error('[CallCenterDashboard] Failed to create staff chat - chatId is null')
