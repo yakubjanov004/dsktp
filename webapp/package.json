@@ -4,8 +4,9 @@
   "private": true,
   "scripts": {
     "build": "next build",
-    "dev": "cross-env NODE_OPTIONS=--no-deprecation next dev -H 0.0.0.0 -p 3200",
-    "dev:clean": "fuser -k 3200/tcp 2>/dev/null || true; npm run dev",
+    "dev": "node ./scripts/dev-server.js",
+    "dev:next": "cross-env NODE_OPTIONS=--no-deprecation next dev -H 0.0.0.0 -p 3200",
+    "dev:clean": "cross-env FORCE_PORT_CLEAN=1 node ./scripts/dev-server.js",
     "kill-port": "fuser -k 3200/tcp 2>/dev/null || (lsof -ti:3200 | xargs kill -9 2>/dev/null) || echo 'Port 3200 is free'",
     "kill-port:win": "powershell -Command \"Get-NetTCPConnection -LocalPort 3200 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }\"",
     "lint": "next lint",
