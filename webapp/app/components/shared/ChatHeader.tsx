@@ -45,7 +45,7 @@ export default function ChatHeader({
   isCompact,
   wsStatus = "connected"
 }: ChatHeaderProps) {
-  const { onlineUsers } = useChat()
+  const { onlineUsers, users } = useChat()
   
   // State to force re-render every minute for "last seen" update
   const [, setTick] = useState(0)
@@ -59,26 +59,56 @@ export default function ChatHeader({
     return () => clearInterval(interval)
   }, [])
   
+  // Get the most up-to-date user data from context (users list)
+  // This is important because ChatContext.users gets refreshed periodically
+  // and contains latest is_online and last_seen_at from API
+  const currentUserData = user?.id 
+    ? users.find(u => u.id === user.id) 
+    : null
+  
+  // Merge user prop with latest context data
+  // Priority: context data (latest) > prop data
+  const mergedUser = currentUserData 
+    ? { ...user, ...currentUserData }
+    : user
+  
   // Determine if user is online
-  // Priority: 1) WebSocket onlineUsers (real-time), 2) user.is_online from database, 3) false
-  // WebSocket status should take priority as it's real-time
-  const isUserOnline = user?.id 
-    ? (onlineUsers.has(user.id) || user?.is_online === true)
-    : false
+  // Priority order:
+  // 1) WebSocket onlineUsers Set (real-time, most accurate for operators/supervisors)
+  // 2) users list from ChatContext (periodically refreshed from API)
+  // 3) user prop is_online (initial value from parent)
+  // 4) false (default)
+  const isUserOnline = (() => {
+    if (!user?.id) return false
+    
+    // Check WebSocket onlineUsers first (real-time updates)
+    if (onlineUsers.has(user.id)) {
+      return true
+    }
+    
+    // Check merged user data from API
+    if (mergedUser?.is_online === true) {
+      return true
+    }
+    
+    return false
+  })()
   
   // Get last seen label
   // Priority for timestamp:
-  // 1. lastClientActivityAt (chat-specific activity)
-  // 2. user.last_seen_at (user's global online status)
+  // 1. mergedUser.last_seen_at (user's global online status from API)
+  // 2. chat.lastClientActivityAt (chat-specific activity)
   // 3. chat.lastActivity (fallback to chat's last activity)
   const getLastSeenTimestamp = (): string | null => {
+    // Prefer user's last_seen_at (more accurate for presence)
+    if (mergedUser?.last_seen_at) {
+      return mergedUser.last_seen_at
+    }
+    // Fallback to chat-specific timestamps
     if (chat.lastClientActivityAt) {
       return chat.lastClientActivityAt
     }
-    if (user?.last_seen_at) {
-      return user.last_seen_at
-    }
-    // Fallback: use chat's lastActivity as approximate "last seen"
+    // Final fallback: use chat's lastActivity as approximate "last seen"
     if (chat.lastActivity) {
       const lastActivity = chat.lastActivity instanceof Date 
         ? chat.lastActivity.toISOString() 

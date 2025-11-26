@@ -7,7 +7,7 @@ import ClientDashboard from "./components/client/ClientDashboard"
 import CallCenterDashboard from "./components/callcenter/CallCenterDashboard"
 import SupervisorDashboard from "./components/callcenter/SupervisorDashboard"
 import { getUserRole, getUserInfo, bootstrapUser, fetchRuntimeConfig, getAuthenticatedUser, updateUserStatus, type DatabaseUser } from "./lib/api"
-import { setOnlineStatus } from "./lib/presence"
+import { setOnlineStatus, setPresenceTelegramId } from "./lib/presence"
 import { setRuntimeWsBaseUrl } from "./lib/wsUrl"
 import { log } from "@/utils/devLogger"
 
@@ -362,6 +362,9 @@ export default function App() {
     if (!telegramUser?.id || !dbUser) return
 
     console.log(`🟢 [PRESENCE] Initializing presence tracking for user: ${dbUser.id} (role: ${dbUser.role})`)
+    
+    // Set telegram_id for dev fallback (used when no Telegram initData available)
+    setPresenceTelegramId(telegramUser.id)
 
     // Initial heartbeat: set online immediately when webapp opens
     setOnlineStatus(true).catch(err => {

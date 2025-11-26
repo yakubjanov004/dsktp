@@ -955,6 +955,27 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     // Stats loaded on-demand, not on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [telegramId, userId]) // Depend on userId too - client needs userId for WebSocket
+  
+  // For clients: periodically refresh operators list to get updated online status
+  // This is necessary because clients don't connect to StatsWebSocket
+  // Operators/supervisors get real-time updates via StatsWebSocket
+  useEffect(() => {
+    if (!telegramId || !userRole) return
+    if (userRole !== 'client') return // Only for clients
+    
+    console.log(`🔄 [PRESENCE-SYNC] Starting periodic operator status refresh for client`)
+    
+    // Refresh operators every 30 seconds to get updated is_online and last_seen_at
+    const refreshInterval = setInterval(() => {
+      console.log(`🔄 [PRESENCE-SYNC] Refreshing operators list for client`)
+      loadUsers()
+    }, 30000) // 30 seconds - matches heartbeat interval
+    
+    return () => {
+      console.log(`🔄 [PRESENCE-SYNC] Stopping periodic operator status refresh`)
+      clearInterval(refreshInterval)
+    }
+  }, [telegramId, userRole, loadUsers])
 
   // Auto-connect WebSocket for all loaded chats when app initializes
   // This ensures real-time updates are available immediately
