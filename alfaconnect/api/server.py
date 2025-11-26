@@ -5,10 +5,11 @@ Enhanced with patterns from fastapi-chat
 """
 import logging
 import logging.config
-from urllib.parse import urlparse
 from datetime import datetime
+from typing import Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -73,6 +74,44 @@ if not parsed.scheme or not parsed.netloc:
 WEBAPP_ORIGIN = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 WS_BASE_URL = WEBAPP_ORIGIN.replace("https://", "wss://").replace("http://", "ws://")
 
+
+def normalize_origin(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    parsed_value = urlparse(value)
+    if parsed_value.scheme and parsed_value.netloc:
+        return f"{parsed_value.scheme}://{parsed_value.netloc}".rstrip("/")
+    return None
+
+
+def resolve_client_origin(request: Request, explicit_origin: Optional[str]) -> Optional[str]:
+    candidates = [
+        explicit_origin,
+        request.headers.get("origin"),
+        request.headers.get("referer"),
+    ]
+    for candidate in candidates:
+        normalized = normalize_origin(candidate)
+        if normalized:
+            return normalized
+
+    forwarded_host = request.headers.get("x-forwarded-host")
+    forwarded_proto = request.headers.get("x-forwarded-proto") or request.headers.get("x-scheme")
+    if forwarded_host:
+        candidate = f"{forwarded_proto or request.url.scheme}://{forwarded_host}"
+        normalized = normalize_origin(candidate)
+        if normalized:
+            return normalized
+
+    host_header = request.headers.get("host")
+    if host_header:
+        candidate = f"{request.url.scheme}://{host_header}"
+        normalized = normalize_origin(candidate)
+        if normalized:
+            return normalized
+
+    return None
+
 # CORS configuration
 allowed_origins = [WEBAPP_ORIGIN]
 if settings.ALLOWED_ORIGINS:
@@ -80,14 +119,45 @@ if settings.ALLOWED_ORIGINS:
     additional_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",")]
     allowed_origins.extend(additional_origins)
 
-logger.info(f"[CORS] Allowing origins: {allowed_origins}")
+dev_origin_regex: Optional[str] = None
+if settings.ENVIRONMENT != "production":
+    dev_origins = [
+        "http://localhost",
+        "http://localhost:3200",
+        "http://127.0.0.1",
+        "http://127.0.0.1:3200",
+    ]
+    allowed_origins.extend(dev_origins)
+    dev_origin_regex = (
+        r"https://.*\.ngrok(-free)?\.(app|dev|io)"
+        r"|http://(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(:\d{1,5})?"
+    )
+
+# Remove duplicates while preserving order
+seen = set()
+deduped_origins = []
+for origin in allowed_origins:
+    if origin and origin not in seen:
+        seen.add(origin)
+        deduped_origins.append(origin)
+
+logger.info(f"[CORS] Allowing origins: {deduped_origins}")
+if dev_origin_regex:
+    logger.info(f"[CORS] Allow origin regex: {dev_origin_regex}")
+
+cors_kwargs = {
+    "allow_origins": deduped_origins,
+    "allow_credentials": True,  # Required for WebSocket connections
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],  # Includes Upgrade and Connection headers needed for WebSocket
+}
+
+if dev_origin_regex:
+    cors_kwargs["allow_origin_regex"] = dev_origin_regex
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,  # Required for WebSocket connections
-    allow_methods=["*"],
-    allow_headers=["*"],  # Includes Upgrade and Connection headers needed for WebSocket
+    **cors_kwargs,
 )
 
 # Include routers with /api prefix only (Next.js rewrite strips it and adds again)
@@ -171,7 +241,7 @@ async def health_check():
 
 @app.get("/api/config")
 @app.get("/config")
-async def get_config(request: Request):
+async def get_config(request: Request, origin: Optional[str] = Query(default=None)):
     """
     Get runtime configuration for WebApp client
     
@@ -192,12 +262,22 @@ async def get_config(request: Request):
     if not WEBAPP_URL:
         raise HTTPException(status_code=500, detail="WEBAPP_URL is not configured")
 
+    client_origin = resolve_client_origin(request, origin)
+    resolved_origin = client_origin or WEBAPP_ORIGIN
+    api_base_url = f"{resolved_origin}/api" if resolved_origin else "/api"
+    ws_origin = resolved_origin.replace("https://", "wss://").replace("http://", "ws://") if resolved_origin else WS_BASE_URL
+    ws_base_url = f"{ws_origin}/api"
+
+    logger.info(f"[/config] Resolved origin: {resolved_origin}")
+    logger.info(f"[/config] API base: {api_base_url}")
+    logger.info(f"[/config] WS base: {ws_base_url}")
+
     response = {
-        "apiBaseUrl": "/api",
-        "wsBaseUrl": f"{WS_BASE_URL}/api",
+        "apiBaseUrl": api_base_url,
+        "wsBaseUrl": ws_base_url,
         "timestamp": datetime.utcnow().isoformat(),
     }
-    logger.info(f"[/config] Returning production domain-based config: {response}")
+    logger.info(f"[/config] Returning runtime config: {response}")
     return response
 
 
