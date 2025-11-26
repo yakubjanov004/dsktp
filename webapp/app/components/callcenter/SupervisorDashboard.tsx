@@ -6,6 +6,7 @@ import ChatWindow from "../shared/ChatWindow"
 import ChatList from "../shared/ChatList"
 import { assignChat, type DatabaseUser } from "../../lib/api"
 import { normalizeChatId } from "@/utils/chatId"
+import CCSStatisticsPanel from "./CCSStatisticsPanel"
 
 interface TelegramUser {
   first_name: string
@@ -146,12 +147,16 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
   const [isLoadingSelectedChat, setIsLoadingSelectedChat] = useState(false)
 
   // Find selected chat from both chatSessions and staffChats
+  // IMPORTANT: Check staffChats FIRST because staff chat IDs can overlap with regular chat IDs
   // Use useMemo to ensure selectedChat updates when chatSessions or staffChats change
+  const isStaffChat = selectedChatId ? staffChats.some((chat) => chat.id === selectedChatId) : false
   const selectedChat = useMemo(() => {
     if (!selectedChatId) return null
-    const chat = chatSessions.find((chat) => chat.id === selectedChatId) || staffChats.find((chat) => chat.id === selectedChatId)
-    console.log('[SupervisorDashboard] 🔍 selectedChat updated:', {
+    // Check staffChats first to handle ID overlap between staff chats and regular chats
+    const chat = staffChats.find((chat) => chat.id === selectedChatId) || chatSessions.find((chat) => chat.id === selectedChatId)
+    console.log('[SupervisorDashboard] selectedChat updated:', {
       selectedChatId,
+      isStaffChat: staffChats.some((c) => c.id === selectedChatId),
       found: !!chat,
       messagesCount: chat?.messages?.length || 0,
       chatSessionsCount: chatSessions.length,
@@ -168,7 +173,6 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
     })
     return chat || null
   }, [selectedChatId, chatSessions, staffChats])
-  const isStaffChat = selectedChatId ? staffChats.some((chat) => chat.id === selectedChatId) : false
 
   // Load messages when chat is selected - loadChatMessages will handle loading chat if needed
   useEffect(() => {
@@ -309,6 +313,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
               { id: "active", label: "Faol chatlar", count: activeChats.length },
               { id: "closed", label: "Chat tarixi", count: allChats.length },
               { id: "staff", label: "Xodimlar bilan chat", count: staffChats.length },
+              { id: "statistics", label: "📊 Statistika", count: undefined },
             ].map((tab) => (
               <button
                 key={tab.id}
@@ -464,6 +469,7 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                 isReadOnly={!isStaffChat}
                 isStaffChat={isStaffChat}
                 isLoadingMessages={isLoadingSelectedChat}
+                isSupervisorView={!isStaffChat}
               />
             ) : (
               <div className="flex items-center justify-center h-full">
@@ -695,6 +701,13 @@ export default function SupervisorDashboard({ user, dbUser, isDarkMode }: Superv
                     />
                   </div>
                 )}
+              </div>
+            ) : activeView === "statistics" ? (
+              <div className="h-full flex flex-col min-h-0">
+                <CCSStatisticsPanel 
+                  isDarkMode={false} 
+                  telegramId={user.id}
+                />
               </div>
             ) : null}
           </div>

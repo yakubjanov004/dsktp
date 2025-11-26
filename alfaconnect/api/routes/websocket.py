@@ -184,7 +184,7 @@ async def stats_websocket_endpoint(websocket: WebSocket):
     online_users[user_id] = True
     online_status_timestamp[user_id] = datetime.now()
     
-    logger.info(f"[STATS-WS] ✓ User {user_id} ({user_role}) connected - marked as online")
+    logger.info(f"[STATS-WS] User {user_id} ({user_role}) connected - marked as online")
     logger.info(f"[STATS-WS] Total online users: {len([u for u, status in online_users.items() if status])}")
     
     try:
@@ -238,7 +238,7 @@ async def stats_websocket_endpoint(websocket: WebSocket):
             del global_connections[user_id]
         online_users[user_id] = False
         online_status_timestamp[user_id] = datetime.now()
-        logger.info(f"[STATS-WS] ✗ User {user_id} ({user_role}) disconnected - marked as offline")
+        logger.info(f"[STATS-WS] User {user_id} ({user_role}) disconnected - marked as offline")
         logger.info(f"[STATS-WS] Total online users: {len([u for u, status in online_users.items() if status])}")
         # Broadcast offline status
         await broadcast_user_status(user_id, False, user_role)
@@ -339,12 +339,12 @@ async def send_chat_message_event(chat_id: int, message: Dict[str, Any]):
             "message.new",
             serialized_message
         )
-        logger.info(f"send_chat_message_event: ✓ Broadcasted via chat manager for chat {chat_id}")
+        logger.info(f"send_chat_message_event: Broadcasted via chat manager for chat {chat_id}")
     except Exception as e:
         logger.warning(f"send_chat_message_event: Error broadcasting via chat manager: {e}")
     
     await _broadcast_global_event(global_event)
-    logger.info(f"send_chat_message_event: ✓ Sent to {len(global_connections)} global connections")
+    logger.info(f"send_chat_message_event: Sent to {len(global_connections)} global connections")
 
 
 async def send_stats_changed_event(inbox_count: int, operator_counts: List[Dict[str, Any]]):
@@ -427,7 +427,7 @@ async def staff_chat_websocket_endpoint(websocket: WebSocket, chat_id: int):
     
     staff_chat_connections[chat_id][user_id] = websocket
     connected_users = list(staff_chat_connections[chat_id].keys())
-    logger.info(f"[STAFF-WS] ✓ User {user_id} ({user_role}) connected to staff chat {chat_id}. Total connections: {len(staff_chat_connections[chat_id])}, users: {connected_users}")
+    logger.info(f"[STAFF-WS] User {user_id} ({user_role}) connected to staff chat {chat_id}. Total connections: {len(staff_chat_connections[chat_id])}, users: {connected_users}")
     
     try:
         # Send recent messages on connect
@@ -581,9 +581,9 @@ async def broadcast_staff_message(message: dict, chat_id: int, exclude_user_id: 
                     continue
                 await websocket.send_json(message)
                 sent_count += 1
-                logger.info(f"[STAFF-BROADCAST] ✓ Sent to user {user_id} in staff chat {chat_id}")
+                logger.info(f"[STAFF-BROADCAST] Sent to user {user_id} in staff chat {chat_id}")
             except Exception as e:
-                logger.error(f"[STAFF-BROADCAST] ✗ Error sending to user {user_id} in staff chat {chat_id}: {e}")
+                logger.error(f"[STAFF-BROADCAST] Error sending to user {user_id} in staff chat {chat_id}: {e}")
                 disconnected.append(user_id)
         
         # Clean up disconnected users
@@ -596,7 +596,7 @@ async def broadcast_staff_message(message: dict, chat_id: int, exclude_user_id: 
         
         logger.info(f"[STAFF-BROADCAST] Summary: Sent to {sent_count}/{len(connected_users)} users in staff chat {chat_id}")
     else:
-        logger.warning(f"[STAFF-BROADCAST] ✗ No active connections for staff chat {chat_id}")
+        logger.warning(f"[STAFF-BROADCAST] No active connections for staff chat {chat_id}")
 
 
 async def send_staff_message_event(chat_id: int, message: Dict[str, Any]):

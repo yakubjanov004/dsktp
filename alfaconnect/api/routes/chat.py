@@ -42,6 +42,12 @@ from database.webapp.staff_chat_queries import (
     get_available_staff,
     close_staff_chat
 )
+from database.webapp.ccs_statistics import (
+    get_ccs_comprehensive_statistics,
+    get_operator_statistics,
+    get_online_users_summary,
+    get_recent_clients
+)
 
 router = APIRouter()
 
@@ -1062,4 +1068,163 @@ async def close_staff_chat_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error closing staff chat: {str(e)}")
+
+
+# ============================================
+# CCS STATISTICS ENDPOINTS
+# ============================================
+
+@router.get("/ccs/statistics")
+async def get_ccs_statistics_endpoint(
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get comprehensive CCS statistics:
+    - Operators list with online status, last seen, answered chats count
+    - Clients list with online status, last seen
+    - Overview statistics
+    - Daily trends
+    
+    Only accessible by supervisors and operators.
+    """
+    try:
+        # Get user to verify role
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        role = user.get('role')
+        if role not in ('callcenter_supervisor', 'callcenter_operator'):
+            raise HTTPException(status_code=403, detail="Only supervisors and operators can access CCS statistics")
+        
+        stats = await get_ccs_comprehensive_statistics()
+        
+        # Convert datetime objects to strings
+        for operator in stats.get('operators', []):
+            if operator.get('last_seen_at'):
+                operator['last_seen_at'] = operator['last_seen_at'].isoformat()
+            if operator.get('created_at'):
+                operator['created_at'] = operator['created_at'].isoformat()
+        
+        for client in stats.get('clients', []):
+            if client.get('last_seen_at'):
+                client['last_seen_at'] = client['last_seen_at'].isoformat()
+            if client.get('created_at'):
+                client['created_at'] = client['created_at'].isoformat()
+            if client.get('last_chat_at'):
+                client['last_chat_at'] = client['last_chat_at'].isoformat()
+        
+        for trend in stats.get('daily_trends', []):
+            if trend.get('date'):
+                trend['date'] = trend['date'].isoformat()
+        
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching CCS statistics: {str(e)}")
+
+
+@router.get("/ccs/operator/{operator_id}")
+async def get_operator_stats_endpoint(
+    operator_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get detailed statistics for a specific operator.
+    Only accessible by supervisors and operators.
+    """
+    try:
+        # Get user to verify role
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        role = user.get('role')
+        if role not in ('callcenter_supervisor', 'callcenter_operator'):
+            raise HTTPException(status_code=403, detail="Only supervisors and operators can access operator statistics")
+        
+        stats = await get_operator_statistics(operator_id)
+        
+        if not stats:
+            raise HTTPException(status_code=404, detail="Operator not found")
+        
+        # Convert datetime objects to strings
+        if stats.get('operator'):
+            op = stats['operator']
+            if op.get('last_seen_at'):
+                op['last_seen_at'] = op['last_seen_at'].isoformat()
+            if op.get('created_at'):
+                op['created_at'] = op['created_at'].isoformat()
+        
+        for activity in stats.get('daily_activity', []):
+            if activity.get('date'):
+                activity['date'] = activity['date'].isoformat()
+        
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching operator statistics: {str(e)}")
+
+
+@router.get("/ccs/online-summary")
+async def get_online_summary_endpoint(
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get quick summary of online users.
+    Used for real-time updates via WebSocket.
+    """
+    try:
+        # Get user to verify role
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        role = user.get('role')
+        if role not in ('callcenter_supervisor', 'callcenter_operator'):
+            raise HTTPException(status_code=403, detail="Only supervisors and operators can access online summary")
+        
+        summary = await get_online_users_summary()
+        return summary
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching online summary: {str(e)}")
+
+
+@router.get("/ccs/recent-clients")
+async def get_recent_clients_endpoint(
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of clients")
+):
+    """
+    Get list of recently active clients (clients who have chatted).
+    Only accessible by supervisors and operators.
+    """
+    try:
+        # Get user to verify role
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        role = user.get('role')
+        if role not in ('callcenter_supervisor', 'callcenter_operator'):
+            raise HTTPException(status_code=403, detail="Only supervisors and operators can access client list")
+        
+        clients = await get_recent_clients(limit)
+        
+        # Convert datetime objects to strings
+        for client in clients:
+            if client.get('last_seen_at'):
+                client['last_seen_at'] = client['last_seen_at'].isoformat()
+            if client.get('last_activity_at'):
+                client['last_activity_at'] = client['last_activity_at'].isoformat()
+        
+        return {"clients": clients, "count": len(clients)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching recent clients: {str(e)}")
 

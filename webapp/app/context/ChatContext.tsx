@@ -1700,6 +1700,116 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]) // initializeStaffWebSocket and loadStaffChatMessages are stable
 
+  // Initialize staff chat WebSocket
+  const initializeStaffWebSocket = useCallback((chatId: string, userId: number) => {
+    if (typeof window === 'undefined' || !window.WebSocket) {
+      return
+    }
+    
+    if (!userId || userId <= 0) {
+      return
+    }
+    
+    const existing = staffWsConnections.current.get(chatId)
+    if (existing) {
+      existing.disconnect()
+      staffWsConnections.current.delete(chatId)
+    }
+
+    try {
+      const ws = new StaffChatWebSocket(
+        parseInt(chatId),
+        userId,
+        (message: Message) => {
+          const messageChatId = message.chat_id.toString()
+          
+          console.log(`[ChatContext] Staff WebSocket received message:`, {
+            chatId: messageChatId,
+            messageId: message.id,
+            senderId: message.sender_id,
+            text: message.message_text?.substring(0, 20)
+          })
+          
+          setStaffChats((prev) => {
+            const chatIndex = prev.findIndex((chat) => chat.id === messageChatId)
+            
+            if (chatIndex >= 0) {
+              const chat = prev[chatIndex]
+              const existingIndex = chat.messages.findIndex((m) => m.id === message.id)
+              
+              if (existingIndex >= 0) {
+                // Message already exists - update it
+                const updatedMessages = [...chat.messages]
+                updatedMessages[existingIndex] = message
+                
+                const updated = [...prev]
+                updated[chatIndex] = {
+                  ...chat,
+                  messages: updatedMessages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()),
+                  lastMessage: message,
+                  lastActivity: new Date(message.created_at),
+                }
+                return updated
+              } else {
+                // Check for temp message with same content (optimistic update)
+                // Temp messages have negative IDs
+                const tempMsgIndex = chat.messages.findIndex((m) => 
+                  m.id < 0 && 
+                  m.message_text === message.message_text &&
+                  m.sender_id === message.sender_id
+                )
+                
+                let newMessages: Message[]
+                if (tempMsgIndex >= 0) {
+                  // Replace temp message with real one
+                  console.log(`[ChatContext] Replacing temp message with real message ID ${message.id}`)
+                  newMessages = [...chat.messages]
+                  newMessages[tempMsgIndex] = message
+                } else {
+                  // Add as new message
+                  newMessages = [...chat.messages, message]
+                }
+                
+                const updated = [...prev]
+                updated[chatIndex] = {
+                  ...chat,
+                  messages: newMessages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()),
+                  lastMessage: message,
+                  lastActivity: new Date(message.created_at),
+                }
+                
+                // Auto-open chat window if callback is set (for operators/supervisors)
+                // Only for new messages (not replacing temp)
+                if (tempMsgIndex < 0 && onNewMessageRef.current) {
+                  onNewMessageRef.current(messageChatId)
+                }
+                
+                return updated
+              }
+            } else {
+              console.warn(`[ChatContext] Staff chat ${messageChatId} not found in staffChats, message ignored`)
+            }
+            return prev
+          })
+        },
+        (userId: number, isTyping: boolean) => {
+          setTypingUsers((prev) => ({
+            ...prev,
+            [`staff_${chatId}-${userId}`]: isTyping,
+          }))
+        },
+        (error: Error) => {
+          console.warn(`Staff chat WebSocket error for chat ${chatId}:`, error)
+        }
+      )
+
+      ws.connect()
+      staffWsConnections.current.set(chatId, ws)
+    } catch (error) {
+      console.warn(`Failed to initialize staff chat WebSocket for chat ${chatId}:`, error)
+    }
+  }, [])
+
   // Load staff chat messages
   const loadStaffChatMessages = useCallback(async (chatId: string, force: boolean = false) => {
     if (!telegramId) return
@@ -1819,6 +1929,16 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       })
       
       loadedMessagesRef.current.add(`staff_${chatId}`)
+      
+      // Initialize WebSocket connection for real-time updates
+      const currentUserId = userIdRef.current
+      if (currentUserId && currentUserId > 0) {
+        // Check if WebSocket connection already exists
+        if (!staffWsConnections.current.has(chatId)) {
+          console.log(`[ChatContext] loadStaffChatMessages: Initializing WebSocket for staff chat ${chatId}`)
+          initializeStaffWebSocket(chatId, currentUserId)
+        }
+      }
     } catch (error) {
       console.error(`Error loading staff chat messages for ${chatId}:`, error)
       // Remove from loaded set on error so we can retry
@@ -1826,87 +1946,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     } finally {
       loadingMessagesRef.current.delete(`staff_${chatId}`)
     }
-  }, [telegramId])
-
-  // Initialize staff chat WebSocket
-  const initializeStaffWebSocket = useCallback((chatId: string, userId: number) => {
-    if (typeof window === 'undefined' || !window.WebSocket) {
-      return
-    }
-    
-    if (!userId || userId <= 0) {
-      return
-    }
-    
-    const existing = staffWsConnections.current.get(chatId)
-    if (existing) {
-      existing.disconnect()
-      staffWsConnections.current.delete(chatId)
-    }
-
-    try {
-      const ws = new StaffChatWebSocket(
-        parseInt(chatId),
-        userId,
-        (message: Message) => {
-          const messageChatId = message.chat_id.toString()
-          
-          setStaffChats((prev) => {
-            const chatIndex = prev.findIndex((chat) => chat.id === messageChatId)
-            
-            if (chatIndex >= 0) {
-              const chat = prev[chatIndex]
-              const existingIndex = chat.messages.findIndex((m) => m.id === message.id)
-              
-              if (existingIndex >= 0) {
-                const updatedMessages = [...chat.messages]
-                updatedMessages[existingIndex] = message
-                
-                const updated = [...prev]
-                updated[chatIndex] = {
-                  ...chat,
-                  messages: updatedMessages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()),
-                  lastMessage: message,
-                  lastActivity: new Date(message.created_at),
-                }
-                return updated
-              } else {
-                const updated = [...prev]
-                updated[chatIndex] = {
-                  ...chat,
-                  messages: [...chat.messages, message].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()),
-                  lastMessage: message,
-                  lastActivity: new Date(message.created_at),
-                }
-                
-                // Auto-open chat window if callback is set (for operators/supervisors)
-                if (onNewMessageRef.current) {
-                  onNewMessageRef.current(messageChatId)
-                }
-                
-                return updated
-              }
-            }
-            return prev
-          })
-        },
-        (userId: number, isTyping: boolean) => {
-          setTypingUsers((prev) => ({
-            ...prev,
-            [`staff_${chatId}-${userId}`]: isTyping,
-          }))
-        },
-        (error: Error) => {
-          console.warn(`Staff chat WebSocket error for chat ${chatId}:`, error)
-        }
-      )
-
-      ws.connect()
-      staffWsConnections.current.set(chatId, ws)
-    } catch (error) {
-      console.warn(`Failed to initialize staff chat WebSocket for chat ${chatId}:`, error)
-    }
-  }, [])
+  }, [telegramId, initializeStaffWebSocket])
 
   // Send staff message
   const sendStaffMessage = useCallback(async (chatId: string, message: string, senderId: number) => {

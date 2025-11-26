@@ -9,9 +9,10 @@ interface MessageBubbleProps {
   isDarkMode: boolean
   isNew: boolean
   senderName: string
+  showSenderName?: boolean  // Always show sender name (for supervisor view)
 }
 
-export default function MessageBubble({ message, isOwnMessage, isDarkMode, isNew, senderName }: MessageBubbleProps) {
+export default function MessageBubble({ message, isOwnMessage, isDarkMode, isNew, senderName, showSenderName = false }: MessageBubbleProps) {
   const [isVisible, setIsVisible] = useState(!isNew)
 
   useEffect(() => {
@@ -47,9 +48,11 @@ export default function MessageBubble({ message, isOwnMessage, isDarkMode, isNew
             : "bg-white text-blue-900 border border-blue-200"
         } ${isOwnMessage ? "rounded-br-md" : "rounded-bl-md"}`}
       >
-        {/* Sender Name (for group chats or multi-agent) */}
-        {!isOwnMessage && senderName && (
-          <p className="text-[10px] xs:text-xs sm:text-xs md:text-sm font-medium mb-0.5 xs:mb-1 sm:mb-1 text-blue-600">{senderName}</p>
+        {/* Sender Name (for group chats, multi-agent, or supervisor view) */}
+        {((showSenderName && senderName) || (!isOwnMessage && senderName)) && (
+          <p className={`text-[10px] xs:text-xs sm:text-xs md:text-sm font-medium mb-0.5 xs:mb-1 sm:mb-1 ${
+            isOwnMessage ? "text-blue-100" : "text-blue-600"
+          }`}>{senderName}</p>
         )}
 
         {/* Message Content */}

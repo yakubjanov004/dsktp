@@ -1905,3 +1905,151 @@ export async function closeStaffChat(chatId: number, telegramId: number): Promis
   }
 }
 
+// =========================================================
+// CCS STATISTICS FUNCTIONS
+// =========================================================
+
+/**
+ * CCS Statistics Types
+ */
+export interface CCSOperator {
+  id: number
+  telegram_id: number
+  full_name: string | null
+  username: string | null
+  phone: string | null
+  role: string
+  is_online: boolean
+  last_seen_at: string | null
+  created_at: string
+  active_chats_count: number
+  total_answered_chats: number
+  today_answered_chats: number
+  week_answered_chats: number
+  total_messages_sent: number
+}
+
+export interface CCSClient {
+  id: number
+  telegram_id: number
+  full_name: string | null
+  username: string | null
+  phone: string | null
+  is_online: boolean
+  last_seen_at: string | null
+  region: string | null
+  abonent_id: string | null
+  active_chats_count: number
+  total_chats_count: number
+  last_chat_at: string | null
+}
+
+export interface CCSOverview {
+  total_operators: number
+  online_operators: number
+  total_supervisors: number
+  online_supervisors: number
+  total_clients: number
+  online_clients: number
+  active_chats: number
+  inbox_chats: number
+  assigned_chats: number
+  today_chats: number
+  week_chats: number
+  month_chats: number
+  today_messages: number
+  week_messages: number
+}
+
+export interface CCSDailyTrend {
+  date: string
+  total_chats: number
+  answered_chats: number
+  closed_chats: number
+}
+
+export interface CCSStatistics {
+  operators: CCSOperator[]
+  clients: CCSClient[]
+  overview: CCSOverview
+  daily_trends: CCSDailyTrend[]
+}
+
+/**
+ * Get comprehensive CCS statistics
+ * Includes operators, clients, overview and daily trends
+ */
+export async function getCCSStatistics(telegramId: number): Promise<CCSStatistics | null> {
+  try {
+    const res = await apiFetch(`${API_BASE}/chat/ccs/statistics?telegram_id=${telegramId}`)
+    
+    if (!res.ok) {
+      console.error(`Failed to fetch CCS statistics: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error fetching CCS statistics:", error)
+    return null
+  }
+}
+
+/**
+ * Get detailed statistics for a specific operator
+ */
+export async function getOperatorStatistics(operatorId: number, telegramId: number): Promise<any | null> {
+  try {
+    const res = await apiFetch(`${API_BASE}/chat/ccs/operator/${operatorId}?telegram_id=${telegramId}`)
+    
+    if (!res.ok) {
+      console.error(`Failed to fetch operator statistics: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error fetching operator statistics:", error)
+    return null
+  }
+}
+
+/**
+ * Get online users summary (for quick real-time updates)
+ */
+export async function getOnlineSummary(telegramId: number): Promise<any | null> {
+  try {
+    const res = await apiFetch(`${API_BASE}/chat/ccs/online-summary?telegram_id=${telegramId}`)
+    
+    if (!res.ok) {
+      console.error(`Failed to fetch online summary: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error fetching online summary:", error)
+    return null
+  }
+}
+
+/**
+ * Get list of recently active clients
+ */
+export async function getRecentClients(telegramId: number, limit: number = 50): Promise<CCSClient[]> {
+  try {
+    const res = await apiFetch(`${API_BASE}/chat/ccs/recent-clients?telegram_id=${telegramId}&limit=${limit}`)
+    
+    if (!res.ok) {
+      console.error(`Failed to fetch recent clients: HTTP ${res.status}`)
+      return []
+    }
+    
+    const data = await res.json()
+    return data.clients || []
+  } catch (error) {
+    console.error("Error fetching recent clients:", error)
+    return []
+  }
+}
+

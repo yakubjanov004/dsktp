@@ -4,11 +4,8 @@ import { useState, useEffect, useCallback } from "react"
 import { useChat } from "../../context/ChatContext"
 import ChatList from "../shared/ChatList"
 import ChatWindow from "../shared/ChatWindow"
-import ClosedChats from "../shared/ClosedChats"
-import FloatingActionButton from "./FloatingActionButton"
-import StatisticsModal from "./StatisticsModal"
-import SearchModal from "./SearchModal"
 import { normalizeChatId } from "@/utils/chatId"
+import CCSStatisticsPanel from "./CCSStatisticsPanel"
 
 interface TelegramUser {
   first_name: string
@@ -21,40 +18,29 @@ interface CallCenterDashboardProps {
   user: TelegramUser
   dbUser?: any
   isDarkMode: boolean
-  onRoleChange: () => void
   role?: "operator" | "supervisor"
 }
 
-export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleChange, role = "operator" }: CallCenterDashboardProps) {
+export default function CallCenterDashboard({ user, dbUser, isDarkMode, role = "operator" }: CallCenterDashboardProps) {
   const { 
     chatSessions,
     staffChats,
     users, 
-    activeChats, 
     addToActiveChats, 
-    removeFromActiveChats, 
-    startNewChat, 
     isLoading, 
     loadChatMessages, 
-    closeChat,
     loadChats,
     loadMyChats,
     loadActiveChatStats,
-    activeChatStats,
     onlineUsers,
     loadStaffChats,
     startStaffChat,
-    sendStaffMessage,
     loadStaffChatMessages,
     setOnNewMessage,
   } = useChat()
   const currentUserId = dbUser?.id || user.id
   const [activeView, setActiveView] = useState("dashboard")
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
-  const [openChatWindows, setOpenChatWindows] = useState<string[]>([])
-  const [showNewChatModal, setShowNewChatModal] = useState(false)
-  const [showStatisticsModal, setShowStatisticsModal] = useState(false)
-  const [showSearchModal, setShowSearchModal] = useState(false)
   const [hasLoadedInitial, setHasLoadedInitial] = useState(false)
   const [showNewStaffChatModal, setShowNewStaffChatModal] = useState(false)
 
@@ -76,16 +62,12 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
            chat.operatorId === currentUserIdStr
   })
   
-  // Chat tarixi = faqat operator o'zi yozishgan chatlar (operator_id = currentUserId)
-  // Bu chatlar operatorga yuborilgan va operator kamida 1 ta xabar yozgan
+  // Chat tarixi = faqat yopilgan (inactive) chatlar
+  // Faol chatlar "Faol chatlar" tabida ko'rinadi, tarixi esa bu yerda
   const chatHistory = chatSessions.filter((chat) => {
-    return chat.operatorId === currentUserIdStr
+    return chat.operatorId === currentUserIdStr && 
+           chat.status === "inactive"
   })
-
-  // Get active chat count from stats
-  const activeChatCount = activeChatStats?.operator_counts.find(
-    (op) => op.operator_id === currentUserId
-  )?.cnt || openChats.length
 
   // Load initial data on mount - only once
   useEffect(() => {
@@ -143,23 +125,15 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
       return
     }
     selectChat(normalized)
-    setOpenChatWindows((prev) => {
-      const filtered = prev.filter((id) => id !== normalized)
-      return [...filtered, normalized]
-    })
     // DON'T remove from active chats - keep WebSocket connection alive for real-time updates
   }
 
-  const handleCloseChatWindow = (chatId: string) => {
-    setOpenChatWindows((prev) => prev.filter((id) => id !== chatId))
-    removeFromActiveChats(chatId)
-  }
-
   // Find selected chat from both chatSessions and staffChats
-  const selectedChat = selectedChatId 
-    ? (chatSessions.find((chat) => chat.id === selectedChatId) || staffChats.find((chat) => chat.id === selectedChatId))
-    : null
+  // IMPORTANT: Check staffChats FIRST because staff chat IDs can overlap with regular chat IDs
   const isStaffChat = selectedChatId ? staffChats.some((chat) => chat.id === selectedChatId) : false
+  const selectedChat = selectedChatId 
+    ? (staffChats.find((chat) => chat.id === selectedChatId) || chatSessions.find((chat) => chat.id === selectedChatId))
+    : null
 
   // Load messages when chat is selected - ensure all messages are loaded for this chat
   useEffect(() => {
@@ -176,24 +150,6 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId, loadChatMessages, loadStaffChatMessages, addToActiveChats])
-
-  const handleCreateNewChat = () => {
-    const clients = users.filter(user => user.role === "client")
-    const randomClient = clients[Math.floor(Math.random() * clients.length)]
-    
-    if (randomClient) {
-      const chatTypes = [
-        "Umumiy yordam so'rovi",
-        "Texnik muammo",
-        "To'lov savoli", 
-        "Funksiya so'rovi"
-      ]
-      const randomType = chatTypes[Math.floor(Math.random() * chatTypes.length)]
-      
-      startNewChat(randomClient.id)
-      setShowNewChatModal(false)
-    }
-  }
 
   return (
     <div className={`h-[100dvh] h-screen w-full ${isDarkMode ? "bg-gray-900" : "bg-gray-50"} safe-area overflow-hidden flex flex-col`}>
@@ -217,28 +173,6 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
               </div>
             </div>
 
-            <div className="flex items-center space-x-1 sm:space-x-1.5 md:space-x-2 flex-shrink-0">
-              {/* Stats */}
-              <div className="flex space-x-1.5 sm:space-x-2">
-                <div
-                  className={`px-2 sm:px-3 md:px-4 py-1 sm:py-1.5 md:py-2 rounded-lg text-xs sm:text-sm md:text-base whitespace-nowrap ${isDarkMode ? "bg-green-900/30 text-green-400" : "bg-green-100 text-green-800"}`}
-                >
-                  <span className="font-medium">{openChats.length} Faol</span>
-                </div>
-              </div>
-
-              <button
-                onClick={onRoleChange}
-                className={`px-2 sm:px-3 md:px-4 py-1.5 sm:py-2 md:py-2.5 rounded-lg text-xs sm:text-sm md:text-base font-medium transition-colors touch-manipulation min-h-[44px] flex items-center justify-center ${
-                  isDarkMode
-                    ? "bg-gray-700 text-gray-300 hover:bg-gray-600 active:bg-gray-500"
-                    : "bg-gray-100 text-gray-700 hover:bg-gray-200 active:bg-gray-300"
-                }`}
-              >
-                <span className="hidden sm:inline">Rolni o'zgartirish</span>
-                <span className="sm:hidden">🔄</span>
-              </button>
-            </div>
           </div>
 
           {/* Navigation Tabs */}
@@ -247,6 +181,7 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
               { id: "dashboard", label: "Faol chatlar", count: openChats.length },
               { id: "closed", label: "Chat tarixi", count: chatHistory.length },
               { id: "staff", label: "Xodimlar bilan chat", count: staffChats.length },
+              { id: "statistics", label: "📊 Statistika", count: undefined },
             ].map((tab) => (
               <button
                 key={tab.id}
@@ -280,46 +215,6 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
         </div>
       </div>
 
-      {/* New Chat Modal */}
-      {showNewChatModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-2 sm:p-4">
-          <div
-            className={`max-w-sm sm:max-w-md w-full p-4 sm:p-6 rounded-xl shadow-2xl ${
-              isDarkMode ? "bg-gray-800 text-white" : "bg-white text-gray-900"
-            }`}
-          >
-            <h3 className={`text-lg sm:text-xl font-bold mb-4 ${isDarkMode ? "text-white" : "text-gray-900"}`}>
-              Yangi chat yaratish
-            </h3>
-            <p className={`mb-6 text-sm sm:text-base ${isDarkMode ? "text-gray-300" : "text-gray-600"}`}>
-              Random mijoz bilan yangi chat yaratiladi.
-            </p>
-            <div className="flex space-x-3">
-              <button
-                onClick={handleCreateNewChat}
-                className={`flex-1 py-2 sm:py-3 px-3 sm:px-4 rounded-lg font-medium transition-colors text-sm sm:text-base ${
-                  isDarkMode
-                    ? "bg-purple-600 text-white hover:bg-purple-700"
-                    : "bg-purple-500 text-white hover:bg-purple-600"
-                }`}
-              >
-                Yaratish
-              </button>
-              <button
-                onClick={() => setShowNewChatModal(false)}
-                className={`flex-1 py-2 sm:py-3 px-3 sm:px-4 rounded-lg font-medium transition-colors text-sm sm:text-base ${
-                  isDarkMode
-                    ? "bg-gray-700 text-gray-300 hover:bg-gray-600"
-                    : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-                }`}
-              >
-                Bekor qilish
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Main Content */}
       <div className="w-full max-w-7xl mx-auto px-2 sm:px-3 md:px-4 lg:px-6 py-2 sm:py-3 md:py-4 lg:py-6 pb-2 sm:pb-3 md:pb-4 lg:pb-6 safe-area-bottom flex-1 flex flex-col min-h-0 overflow-hidden">
         {selectedChat ? (
@@ -327,19 +222,12 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
             <ChatWindow
               chat={selectedChat}
               currentUserId={currentUserId}
-              onBack={() => {
-                setSelectedChatId(null)
-                // Pastki o'ng burchakdagi kichik oynalarni ham yopish
-                setOpenChatWindows([])
-              }}
-              onClose={() => {
-                setSelectedChatId(null)
-                // Pastki o'ng burchakdagi kichik oynalarni ham yopish
-                setOpenChatWindows([])
-              }}
+              onBack={() => setSelectedChatId(null)}
+              onClose={() => setSelectedChatId(null)}
               isDarkMode={isDarkMode}
               isReadOnly={!isStaffChat && selectedChat.status === "inactive"}
               isStaffChat={isStaffChat}
+              isSupervisorView={!isStaffChat && activeView === "closed"}
             />
           </div>
         ) : (
@@ -458,6 +346,13 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
                     />
                   </div>
                 )}
+              </div>
+            ) : activeView === "statistics" ? (
+              <div className="h-full flex flex-col min-h-0">
+                <CCSStatisticsPanel 
+                  isDarkMode={isDarkMode} 
+                  telegramId={user.id}
+                />
               </div>
             ) : null}
           </div>
@@ -579,52 +474,6 @@ export default function CallCenterDashboard({ user, dbUser, isDarkMode, onRoleCh
         </div>
       )}
 
-      {/* Chat Windows - Only show in Dashboard and when no selected chat */}
-      {activeView === "dashboard" && !selectedChatId && openChatWindows.map((chatId) => {
-        const chat = chatSessions.find((c) => c.id === chatId)
-        if (!chat) return null
-
-        return (
-          <div
-            key={chatId}
-            className="fixed bottom-4 right-4 w-72 h-80 sm:w-80 sm:h-96 z-30 animate-slide-up"
-            style={{
-              right: `${4 + openChatWindows.indexOf(chatId) * 280}px`,
-              zIndex: 30 + openChatWindows.indexOf(chatId),
-            }}
-          >
-            <ChatWindow
-              chat={chat}
-              currentUserId={currentUserId}
-              onBack={() => {}}
-              isDarkMode={isDarkMode}
-              isFloating={true}
-              onClose={() => handleCloseChatWindow(chatId)}
-            />
-          </div>
-        )
-      })}
-
-      {/* Modals */}
-      <StatisticsModal 
-        isOpen={showStatisticsModal}
-        onClose={() => setShowStatisticsModal(false)}
-        isDarkMode={isDarkMode}
-      />
-      
-      <SearchModal 
-        isOpen={showSearchModal}
-        onClose={() => setShowSearchModal(false)}
-        isDarkMode={isDarkMode}
-      />
-
-      {/* Floating Action Button */}
-      <FloatingActionButton 
-        isDarkMode={isDarkMode}
-        onNewChat={() => setShowNewChatModal(true)}
-        onSearch={() => setShowSearchModal(true)}
-        onStatistics={() => setShowStatisticsModal(true)}
-      />
     </div>
   )
 }

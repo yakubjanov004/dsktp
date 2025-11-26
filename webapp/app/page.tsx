@@ -523,7 +523,6 @@ export default function App() {
               user={telegramUser!}
               dbUser={dbUser}
               isDarkMode={isDarkMode}
-              onRoleChange={() => setCurrentRole(null)}
               role="operator"
             />
           ) : currentRole === "ccsupervisor" ? (
@@ -537,7 +536,6 @@ export default function App() {
               user={telegramUser!}
               dbUser={dbUser}
               isDarkMode={isDarkMode}
-              onRoleChange={() => setCurrentRole(null)}
             />
           )}
         </div>

@@ -35,14 +35,14 @@ def is_user_online(last_seen_at: Optional[datetime]) -> bool:
     return time_diff <= ONLINE_TTL
 
 
-async def update_user_last_seen(user_id: int, last_seen_at: Optional[datetime] = None) -> bool:
+async def update_user_last_seen(user_id: int, last_seen_at: Optional[datetime] = None, is_online: Optional[bool] = None) -> bool:
     """
-    Update user last_seen_at timestamp (heartbeat).
-    is_online is calculated from last_seen_at using TTL, not stored.
+    Update user last_seen_at timestamp and is_online status (heartbeat).
     
     Args:
         user_id: User ID
         last_seen_at: Timestamp (defaults to now if None)
+        is_online: Online status (True/False). If None, calculated from TTL.
         
     Returns:
         True if update successful, False otherwise
@@ -50,16 +50,22 @@ async def update_user_last_seen(user_id: int, last_seen_at: Optional[datetime] =
     if last_seen_at is None:
         last_seen_at = datetime.now(timezone.utc)
     
+    # Calculate is_online if not provided
+    if is_online is None:
+        is_online = True  # If sending heartbeat, user is online
+    
     conn = await asyncpg.connect(settings.DB_URL)
     try:
         await conn.execute(
             """
             UPDATE users
             SET last_seen_at = $1,
+                is_online = $2,
                 updated_at = $1
-            WHERE id = $2
+            WHERE id = $3
             """,
             last_seen_at,
+            is_online,
             user_id
         )
         return True

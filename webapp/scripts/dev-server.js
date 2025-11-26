@@ -42,15 +42,11 @@ const env = {
   NODE_OPTIONS: process.env.NODE_OPTIONS || "--no-deprecation",
 }
 
-const child = spawn(
-  "npx",
-  ["next", "dev", "-H", host, "-p", String(port)],
-  {
-    stdio: "inherit",
-    env,
-    shell: false,
-  }
-)
+// On Windows, run via shell with full command string to avoid EINVAL and deprecation warning
+const args = ["next", "dev", "-H", host, "-p", String(port)]
+const child = isWindows
+  ? spawn(`npx ${args.join(" ")}`, [], { stdio: "inherit", env, shell: true })
+  : spawn("npx", args, { stdio: "inherit", env })
 
 function shutdown(reason) {
   if (shuttingDown) return

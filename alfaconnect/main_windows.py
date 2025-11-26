@@ -40,9 +40,15 @@ if settings.ENVIRONMENT == "development":
         local_ip = socket.gethostbyname(socket.gethostname())
     
     # Agar WEBAPP_URL production domen bo'lsa, uni lokal IP ga o'zgartirish
-    if settings.WEBAPP_URL and ("darrov.uz" in settings.WEBAPP_URL or settings.WEBAPP_URL.startswith("https://")):
+    # Ngrok URL larni o'zgartirmaslik (ular development uchun HTTPS tunnel)
+    if settings.WEBAPP_URL and "ngrok" in settings.WEBAPP_URL:
+        WEBAPP_URL = settings.WEBAPP_URL
+        logger.info(f"✅ Using ngrok tunnel URL: {WEBAPP_URL}")
+    elif settings.WEBAPP_URL and ("darrov.uz" in settings.WEBAPP_URL or settings.WEBAPP_URL.startswith("https://")):
         WEBAPP_URL = f"http://{local_ip}:{WEBAPP_PORT}"
         logger.warning(f"⚠️  Development mode detected! WEBAPP_URL changed from {settings.WEBAPP_URL} to {WEBAPP_URL}")
+        # Settings'ni ham yangilash (keyboards uchun)
+        settings.WEBAPP_URL = WEBAPP_URL
     else:
         WEBAPP_URL = settings.WEBAPP_URL
     # PUBLIC_HOST ni ham lokal IP ga o'zgartirish (agar localhost bo'lsa)

@@ -378,8 +378,10 @@ async def update_user_status(
     current_user: dict = Depends(get_current_user_from_init_data)
 ):
     """
-    Update user last_seen_at timestamp (heartbeat).
-    is_online is calculated from last_seen_at using TTL (60 seconds), not stored.
+    Update user online status and last_seen_at timestamp.
+    
+    - When is_online=true: User is online, last_seen_at updated to now
+    - When is_online=false: User is offline, last_seen_at updated to now (for "X minutes ago" calculation)
     
     ⚡ Lightweight: Simple DB update, no external calls.
     
@@ -391,27 +393,28 @@ async def update_user_status(
         user_role = current_user.get('role')
         now = datetime.now(timezone.utc)
         
-        # Always update last_seen_at (heartbeat)
-        # If is_online=false, we still update timestamp (explicit offline signal)
+        # is_online from request (True when webapp open, False when closing)
+        is_online = request.is_online
+        
+        # Update both last_seen_at and is_online in database
+        # When going offline, last_seen_at = now (the moment they went offline)
         success = await update_user_last_seen(
             user_id=user_id,
-            last_seen_at=now
+            last_seen_at=now,
+            is_online=is_online
         )
         
         if not success:
-            raise HTTPException(status_code=500, detail="Failed to update user last_seen_at in database")
-        
-        # Calculate actual is_online from updated last_seen_at
-        calculated_is_online = is_user_online(now) if request.is_online else False
+            raise HTTPException(status_code=500, detail="Failed to update user status in database")
         
         # Update in-memory presence tracking (used by WebSocket system)
         try:
             from api.routes.websocket import online_users, online_status_timestamp, broadcast_user_status
-            online_users[user_id] = calculated_is_online
+            online_users[user_id] = is_online
             online_status_timestamp[user_id] = now
             
             # Broadcast status change to other users via WebSocket
-            await broadcast_user_status(user_id, calculated_is_online, user_role)
+            await broadcast_user_status(user_id, is_online, user_role)
         except Exception as ws_error:
             # WebSocket broadcast is optional, log but don't fail
             import logging
@@ -419,7 +422,7 @@ async def update_user_status(
         
         return {
             "status": "success",
-            "is_online": calculated_is_online,  # Calculated from last_seen_at
+            "is_online": is_online,
             "user_id": user_id,
             "last_seen_at": now.isoformat(),
             "timestamp": now.isoformat()

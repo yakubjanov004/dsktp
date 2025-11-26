@@ -1,5 +1,6 @@
 "use client"
 
+import { useState, useEffect } from "react"
 import { type Message } from "../../lib/api"
 import { useChat } from "../../context/ChatContext"
 
@@ -46,6 +47,18 @@ export default function ChatList({
   emptyMessage = "Chatlar topilmadi",
 }: ChatListProps) {
   const { typingUsers, unreadCounts, onlineUsers } = useChat()
+  
+  // State to force re-render every 30 seconds for time updates
+  const [, setTick] = useState(0)
+  
+  // Update every 30 seconds to keep time labels accurate
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTick(prev => prev + 1)
+    }, 30000) // 30 seconds
+    
+    return () => clearInterval(interval)
+  }, [])
 
   const formatLastActivity = (timestamp: Date | string) => {
     const now = new Date()

@@ -80,7 +80,7 @@ export async function setOnlineStatus(isOnline: boolean): Promise<boolean> {
  * Get human-readable label for user's last seen status
  * @param isOnline - Whether user is currently online
  * @param lastSeenAt - ISO timestamp string of when user was last seen
- * @returns Human-readable label like "Online", "Last seen 5 minutes ago", etc.
+ * @returns Human-readable label like "Online", "5 daqiqa oldin", etc.
  */
 export function getLastSeenLabel(
   isOnline: boolean,
@@ -107,48 +107,48 @@ export function getLastSeenLabel(
     const diffMin = Math.floor(diffMs / 60000)
 
     if (diffMin < 1) {
-      return "Last seen just now"
+      return "Hozirgina online edi"
     }
     if (diffMin === 1) {
-      return "Last seen 1 minute ago"
+      return "1 daqiqa oldin"
     }
     if (diffMin < 60) {
-      return `Last seen ${diffMin} minutes ago`
+      return `${diffMin} daqiqa oldin`
     }
 
     const diffHours = Math.floor(diffMin / 60)
     if (diffHours === 1) {
-      return "Last seen 1 hour ago"
+      return "1 soat oldin"
     }
     if (diffHours < 24) {
-      return `Last seen ${diffHours} hours ago`
+      return `${diffHours} soat oldin`
     }
 
     const diffDays = Math.floor(diffHours / 24)
     if (diffDays === 1) {
-      return "Last seen 1 day ago"
+      return "1 kun oldin"
     }
     if (diffDays < 7) {
-      return `Last seen ${diffDays} days ago`
+      return `${diffDays} kun oldin`
     }
 
     const diffWeeks = Math.floor(diffDays / 7)
     if (diffWeeks === 1) {
-      return "Last seen 1 week ago"
+      return "1 hafta oldin"
     }
     if (diffWeeks < 4) {
-      return `Last seen ${diffWeeks} weeks ago`
+      return `${diffWeeks} hafta oldin`
     }
 
     const diffMonths = Math.floor(diffDays / 30)
     if (diffMonths === 1) {
-      return "Last seen 1 month ago"
+      return "1 oy oldin"
     }
     if (diffMonths < 12) {
-      return `Last seen ${diffMonths} months ago`
+      return `${diffMonths} oy oldin`
     }
 
-    return "Last seen long time ago"
+    return "Uzoq vaqt oldin"
   } catch (error) {
     console.error("[getLastSeenLabel] Error parsing date:", error)
     return "Offline"

@@ -32,6 +32,7 @@ interface ChatWindowProps {
   isFloating?: boolean
   isStaffChat?: boolean
   isLoadingMessages?: boolean
+  isSupervisorView?: boolean  // CCS viewing client chats - shows operator messages on right with names
 }
 
 export default function ChatWindow({
@@ -45,6 +46,7 @@ export default function ChatWindow({
   isFloating = false,
   isStaffChat = false,
   isLoadingMessages = false,
+  isSupervisorView = false,
 }: ChatWindowProps) {
   const { users, sendMessage, sendStaffMessage, closeChat, typingUsers } = useChat()
   const [showScrollButton, setShowScrollButton] = useState(false)
@@ -282,24 +284,54 @@ export default function ChatWindow({
           ) : chat.messages && chat.messages.length > 0 ? (
             chat.messages.map((message: Message, index: number) => {
               const messageSenderId = typeof message.sender_id === "string" ? parseInt(message.sender_id) : message.sender_id
-              const isOwnMessage = messageSenderId === currentUserIdNum
+              
+              // CCS (supervisor) viewing client chats:
+              // - Client messages → LEFT side
+              // - Operator messages → RIGHT side (with operator name shown)
+              // Normal view: own messages on right, others on left
+              let isOwnMessage: boolean
+              if (isSupervisorView && !isStaffChat) {
+                // Supervisor viewing client chat - operator messages on right
+                isOwnMessage = message.sender_type === "operator"
+              } else {
+                // Normal view - own messages on right
+                isOwnMessage = messageSenderId === currentUserIdNum
+              }
               
               // Har bir xabar uchun to'g'ri yuboruvchi ismini topish
-              // Agar xabar o'z xabari bo'lsa, "Siz" ko'rsatiladi
-              // Aks holda, users array'dan sender_id bo'yicha foydalanuvchini topamiz
-              let senderName = "Foydalanuvchi"
-              if (isOwnMessage) {
-                senderName = "Siz"
+              let senderName = ""
+              
+              if (isSupervisorView && !isStaffChat) {
+                // Supervisor view: Show operator names on RIGHT, client name on LEFT
+                if (message.sender_type === "operator") {
+                  // Find operator name from users list or message.sender_name
+                  const operatorUser = users.find((u) => u.id === messageSenderId)
+                  if (operatorUser) {
+                    senderName = operatorUser.full_name || "Operator"
+                  } else if (message.sender_name) {
+                    senderName = message.sender_name
+                  } else {
+                    senderName = "Operator"
+                  }
+                } else {
+                  // Client message - show client name
+                  senderName = chat.clientName || message.sender_name || "Mijoz"
+                }
               } else {
-                // Xabar yuboruvchi foydalanuvchini topish
-                const messageSender = users.find((u) => u.id === messageSenderId)
-                if (messageSender) {
-                  senderName = messageSender.full_name || "Foydalanuvchi"
-                } else if (message.sender_name) {
-                  senderName = message.sender_name
-                } else if (otherUser && messageSenderId === otherUserId) {
-                  // Fallback: agar otherUser topilgan bo'lsa va ID mos kelsa
-                  senderName = otherUser.full_name || "Foydalanuvchi"
+                // Normal view
+                if (isOwnMessage) {
+                  senderName = "Siz"
+                } else {
+                  // Xabar yuboruvchi foydalanuvchini topish
+                  const messageSender = users.find((u) => u.id === messageSenderId)
+                  if (messageSender) {
+                    senderName = messageSender.full_name || "Foydalanuvchi"
+                  } else if (message.sender_name) {
+                    senderName = message.sender_name
+                  } else if (otherUser && messageSenderId === otherUserId) {
+                    // Fallback: agar otherUser topilgan bo'lsa va ID mos kelsa
+                    senderName = otherUser.full_name || "Foydalanuvchi"
+                  }
                 }
               }
               
@@ -311,6 +343,7 @@ export default function ChatWindow({
                   isDarkMode={false}
                   isNew={index === chat.messages.length - 1}
                   senderName={senderName}
+                  showSenderName={isSupervisorView && !isStaffChat}
                 />
               )
             })

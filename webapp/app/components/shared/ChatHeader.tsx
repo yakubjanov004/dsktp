@@ -1,5 +1,6 @@
 "use client"
 
+import { useState, useEffect } from "react"
 import { useChat } from "../../context/ChatContext"
 import { getLastSeenLabel } from "../../lib/presence"
 import type { DatabaseUser, Chat } from "../../lib/api"
@@ -46,19 +47,56 @@ export default function ChatHeader({
 }: ChatHeaderProps) {
   const { onlineUsers } = useChat()
   
+  // State to force re-render every minute for "last seen" update
+  const [, setTick] = useState(0)
+  
+  // Update every 30 seconds to keep "last seen" accurate
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTick(prev => prev + 1)
+    }, 30000) // 30 seconds
+    
+    return () => clearInterval(interval)
+  }, [])
+  
   // Determine if user is online
-  // Priority: 1) user.is_online from database, 2) WebSocket onlineUsers, 3) false
-  const isUserOnline = user?.is_online ?? (user?.id ? onlineUsers.has(user.id) : false)
+  // Priority: 1) WebSocket onlineUsers (real-time), 2) user.is_online from database, 3) false
+  // WebSocket status should take priority as it's real-time
+  const isUserOnline = user?.id 
+    ? (onlineUsers.has(user.id) || user?.is_online === true)
+    : false
   
   // Get last seen label
-  // For CCS view, if lastClientActivityAt is available, use it to calculate "Last seen X minutes ago"
-  // Otherwise, use user's online status and last_seen_at
-  const lastSeenAt = chat.lastClientActivityAt || user?.last_seen_at
-  // If we have lastClientActivityAt, always calculate from that (don't use isOnline check)
-  // Otherwise, use normal online/offline logic
-  const lastSeenLabel = chat.lastClientActivityAt 
-    ? getLastSeenLabel(false, lastSeenAt) // Always calculate from timestamp, ignore online status
-    : getLastSeenLabel(isUserOnline, lastSeenAt)
+  // Priority for timestamp:
+  // 1. lastClientActivityAt (chat-specific activity)
+  // 2. user.last_seen_at (user's global online status)
+  // 3. chat.lastActivity (fallback to chat's last activity)
+  const getLastSeenTimestamp = (): string | null => {
+    if (chat.lastClientActivityAt) {
+      return chat.lastClientActivityAt
+    }
+    if (user?.last_seen_at) {
+      return user.last_seen_at
+    }
+    // Fallback: use chat's lastActivity as approximate "last seen"
+    if (chat.lastActivity) {
+      const lastActivity = chat.lastActivity instanceof Date 
+        ? chat.lastActivity.toISOString() 
+        : chat.lastActivity
+      return lastActivity
+    }
+    return null
+  }
+  
+  const lastSeenAt = getLastSeenTimestamp()
+  
+  // If we have a timestamp and user is offline, show "X daqiqa oldin"
+  // Otherwise, if online show "Online"
+  const lastSeenLabel = isUserOnline 
+    ? "🟢 Online" 
+    : lastSeenAt 
+      ? getLastSeenLabel(false, lastSeenAt)
+      : "Offline"
 
   return (
     <div className={`px-2 xs:px-2.5 sm:px-3 md:px-4 py-2 xs:py-2.5 sm:py-2.5 md:py-3 flex items-center justify-between bg-white flex-shrink-0 w-full ${isCompact ? "px-1.5 xs:px-2 sm:px-2.5 md:px-3 py-1.5 xs:py-2" : ""}`}>
@@ -95,7 +133,9 @@ export default function ChatHeader({
             </h3>
             {!isCompact && (
               <div className="flex items-center gap-1.5">
-                <p className="text-[10px] xs:text-xs sm:text-xs md:text-xs truncate text-gray-500">
+                <p className={`text-[10px] xs:text-xs sm:text-xs md:text-xs truncate ${
+                  isUserOnline ? "text-green-600 font-medium" : "text-gray-500"
+                }`}>
                   {lastSeenLabel}
                 </p>
               </div>
