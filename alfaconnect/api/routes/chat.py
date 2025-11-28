@@ -1,10 +1,16 @@
 """
 Chat-related API endpoints
 """
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, HTTPException, Query, Body, UploadFile, File
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
+import os
+import uuid
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from database.webapp.chat_queries import (
     create_chat,
     get_user_chats,
@@ -17,7 +23,10 @@ from database.webapp.chat_queries import (
     get_supervisor_inbox,
     get_operator_chats,
     get_supervisor_active_chats,
-    get_active_chat_counts
+    get_active_chat_counts,
+    pin_chat,
+    unpin_chat,
+    get_pinned_chats
 )
 from api.routes.websocket import (
     send_chat_assigned_event,
@@ -29,9 +38,20 @@ from database.webapp.message_queries import (
     create_message,
     get_chat_messages,
     get_unread_messages_count,
-    get_message_by_id
+    get_message_by_id,
+    mark_message_read,
+    get_message_reads,
+    mark_chat_messages_read,
+    get_message_reactions,
+    toggle_message_reaction,
+    search_messages,
+    forward_message,
+    get_chat_media,
+    edit_message,
+    get_message_thread
 )
-from database.webapp.user_queries import get_user_by_telegram_id
+from database.webapp.user_queries import get_user_by_telegram_id, get_user_by_id
+from config import settings
 from database.webapp.staff_chat_queries import (
     create_staff_chat,
     get_staff_chats,
@@ -64,6 +84,7 @@ class SendMessageRequest(BaseModel):
     sender_type: str  # 'client', 'operator', or 'system'
     operator_id: Optional[int] = None  # Required when sender_type='operator', must match sender_id
     attachments: Optional[Dict[str, Any]] = None  # JSONB attachments
+    reply_to_message_id: Optional[int] = None  # ID of the message being replied to
 
 
 class AssignChatRequest(BaseModel):
@@ -78,6 +99,10 @@ class SendStaffMessageRequest(BaseModel):
     sender_id: int
     message_text: str
     attachments: Optional[Dict[str, Any]] = None
+
+
+class ReactionRequest(BaseModel):
+    emoji: str  # Emoji string (e.g., "👍", "❤️", "😂")
 
 
 @router.get("/list")
@@ -115,6 +140,8 @@ async def get_chats(
                 chat['updated_at'] = chat['updated_at'].isoformat()
             if chat.get('last_activity_at'):
                 chat['last_activity_at'] = chat['last_activity_at'].isoformat()
+            if chat.get('pinned_at'):
+                chat['pinned_at'] = chat['pinned_at'].isoformat()
         
         return {"chats": chats, "count": len(chats)}
     except HTTPException:
@@ -563,12 +590,24 @@ async def send_chat_message_endpoint(chat_id: int, request: SendMessageRequest):
         client_id = chat.get('client_id')
         operator_id = chat.get('operator_id')
         
-        # Allow client or operator to send messages
+        # Get sender user to check role (for supervisor access)
+        sender_user = None
+        sender_role = None
+        try:
+            sender_user = await get_user_by_id(request.sender_id)
+            sender_role = sender_user.get('role') if sender_user else None
+        except Exception as e:
+            logger.warning(f"Could not get sender user by id {request.sender_id}: {e}")
+        
+        # Allow client, operator, or supervisor to send messages
         allowed_users = [client_id]
         if operator_id:
             allowed_users.append(operator_id)
         
-        if request.sender_id not in allowed_users:
+        # Supervisors can send messages to any chat
+        is_supervisor = sender_role == 'callcenter_supervisor'
+        
+        if request.sender_id not in allowed_users and not is_supervisor:
             raise HTTPException(status_code=403, detail="User is not a participant in this chat")
         
         # Validate message text (required per new schema)
@@ -600,13 +639,24 @@ async def send_chat_message_endpoint(chat_id: int, request: SendMessageRequest):
             operator_id_for_message = None
         # For client messages, operator_id is NULL
         
+        # Validate reply_to_message_id if provided
+        reply_to_message_id = request.reply_to_message_id
+        if reply_to_message_id:
+            # Verify that the reply message exists and belongs to the same chat
+            reply_message = await get_message_by_id(reply_to_message_id)
+            if not reply_message:
+                raise HTTPException(status_code=404, detail="Reply message not found")
+            if reply_message.get('chat_id') != chat_id:
+                raise HTTPException(status_code=400, detail="Reply message must be in the same chat")
+        
         message_id = await create_message(
             chat_id=chat_id,
             sender_id=sender_id_for_message,
             message_text=request.message_text.strip(),
             sender_type=request.sender_type,
             operator_id=operator_id_for_message,
-            attachments=request.attachments
+            attachments=request.attachments,
+            reply_to_message_id=reply_to_message_id
         )
         
         if not message_id:
@@ -1237,4 +1287,839 @@ async def get_recent_clients_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching recent clients: {str(e)}")
+
+
+@router.post("/{chat_id}/messages/{message_id}/reactions")
+async def toggle_reaction(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    reaction: ReactionRequest = Body(...)
+):
+    """
+    Toggle a reaction on a message.
+    If user already has this emoji reaction, remove it.
+    If user has a different emoji reaction, replace it.
+    If user has no reaction, add it.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Verify message exists and belongs to chat
+        message = await get_message_by_id(message_id)
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        if message.get('chat_id') != chat_id:
+            raise HTTPException(status_code=400, detail="Message does not belong to this chat")
+        
+        # Validate emoji (basic validation - should be 1-10 characters)
+        emoji = reaction.emoji.strip()
+        
+        if emoji and len(emoji) > 10:
+            raise HTTPException(status_code=400, detail="Invalid emoji")
+        
+        # Toggle reaction (handles empty emoji for removal)
+        result = await toggle_message_reaction(message_id, user_id, emoji)
+        
+        # Broadcast reaction event via WebSocket
+        from api.routes.websocket import send_message_reaction_event
+        await send_message_reaction_event(chat_id, message_id, user_id, emoji, result["action"])
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error toggling reaction: {str(e)}")
+
+
+@router.get("/{chat_id}/messages/{message_id}/reactions")
+async def get_reactions(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get all reactions for a message.
+    """
+    try:
+        # Get user (for auth, but reactions are visible to all chat participants)
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Verify message exists and belongs to chat
+        message = await get_message_by_id(message_id)
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        if message.get('chat_id') != chat_id:
+            raise HTTPException(status_code=400, detail="Message does not belong to this chat")
+        
+        # Get reactions
+        reactions = await get_message_reactions(message_id)
+        
+        return {"reactions": reactions}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching reactions: {str(e)}")
+
+
+@router.get("/{chat_id}/search")
+async def search_chat_messages(
+    chat_id: int,
+    query: str = Query(..., description="Search query string", min_length=1),
+    limit: int = Query(50, description="Maximum number of results", ge=1, le=100),
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Search messages in a chat using full-text search.
+    """
+    try:
+        # Get user (for auth)
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Search messages
+        messages = await search_messages(chat_id, query, limit)
+        
+        return {
+            "chat_id": chat_id,
+            "query": query,
+            "results": messages,
+            "count": len(messages)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching messages: {str(e)}")
+
+
+class ForwardRequest(BaseModel):
+    target_chat_id: int
+
+
+@router.post("/{chat_id}/messages/{message_id}/forward")
+async def forward_chat_message(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    request: ForwardRequest = Body(...)
+):
+    """
+    Forward a message to another chat.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        user_role = user.get('role', 'client')
+        
+        # Verify source message exists and belongs to chat
+        source_message = await get_message_by_id(message_id)
+        if not source_message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        if source_message.get('chat_id') != chat_id:
+            raise HTTPException(status_code=400, detail="Message does not belong to this chat")
+        
+        # Verify target chat exists
+        target_chat = await get_chat_by_id(request.target_chat_id)
+        if not target_chat:
+            raise HTTPException(status_code=404, detail="Target chat not found")
+        
+        # Forward message
+        sender_type = 'operator' if user_role == 'operator' else 'client'
+        operator_id = user_id if user_role == 'operator' else None
+        
+        new_message_id = await forward_message(
+            message_id,
+            request.target_chat_id,
+            user_id,
+            sender_type,
+            operator_id
+        )
+        
+        if not new_message_id:
+            raise HTTPException(status_code=500, detail="Failed to forward message")
+        
+        # Get the new forwarded message
+        new_message = await get_message_by_id(new_message_id)
+        
+        # Broadcast forward event via WebSocket (uses same event as regular messages)
+        from api.routes.websocket import send_chat_message_event
+        await send_chat_message_event(request.target_chat_id, new_message)
+        
+        return {
+            "success": True,
+            "message_id": new_message_id,
+            "target_chat_id": request.target_chat_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error forwarding message: {str(e)}")
+
+
+# Audio file validation
+ALLOWED_AUDIO_FORMATS = ["audio/mpeg", "audio/mp3", "audio/ogg", "audio/wav", "audio/webm", "audio/opus", "audio/mp4", "audio/aac", "audio/x-m4a"]
+MAX_AUDIO_SIZE = 20 * 1024 * 1024  # 20MB
+
+
+@router.post("/{chat_id}/messages/voice")
+async def upload_voice_message(
+    chat_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    audio: UploadFile = File(..., description="Audio file")
+):
+    """
+    Upload a voice message to a chat.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        user_role = user.get('role', 'client')
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Validate audio file
+        if audio.content_type not in ALLOWED_AUDIO_FORMATS:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid audio format. Allowed: {', '.join(ALLOWED_AUDIO_FORMATS)}"
+            )
+        
+        # Read audio file
+        audio_data = await audio.read()
+        audio_size = len(audio_data)
+        
+        if audio_size > MAX_AUDIO_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio file too large. Maximum size: {MAX_AUDIO_SIZE / (1024 * 1024)}MB"
+            )
+        
+        if audio_size == 0:
+            raise HTTPException(status_code=400, detail="Audio file is empty")
+        
+        # Determine file extension
+        content_type_to_ext = {
+            "audio/mpeg": "mp3",
+            "audio/mp3": "mp3",
+            "audio/ogg": "ogg",
+            "audio/wav": "wav",
+            "audio/webm": "webm",
+            "audio/opus": "opus",
+            "audio/mp4": "mp4",
+            "audio/aac": "aac",
+            "audio/x-m4a": "m4a"
+        }
+        file_ext = content_type_to_ext.get(audio.content_type, "mp3")
+        
+        # Create message first to get message_id
+        # Determine sender_type based on role
+        if user_role in ('callcenter_operator', 'callcenter_supervisor'):
+            sender_type = 'operator'
+            operator_id = user_id
+        else:
+            sender_type = 'client'
+            operator_id = None
+        
+        message_id = await create_message(
+            chat_id=chat_id,
+            sender_id=user_id,
+            sender_type=sender_type,
+            message_text="",
+            operator_id=operator_id,
+            attachments=None
+        )
+        
+        if not message_id:
+            raise HTTPException(status_code=500, detail="Failed to create message")
+        
+        # Save audio file and update message in one transaction
+        voice_dir = Path(settings.MEDIA_ROOT) / "voice" / str(chat_id)
+        voice_dir.mkdir(parents=True, exist_ok=True)
+        
+        audio_filename = f"{message_id}.{file_ext}"
+        audio_path = voice_dir / audio_filename
+        
+        audio_url = f"/api/media/voice/{chat_id}/{audio_filename}"
+        attachments = {
+            "type": "voice",
+            "url": audio_url,
+            "filename": audio_filename,
+            "size": audio_size,
+            "duration": None
+        }
+        
+        # Save file and update database in one try-except block
+        import asyncpg
+        conn = None
+        try:
+            # Save audio file first
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
+            
+            # Update message with audio attachment
+            conn = await asyncpg.connect(settings.DB_URL)
+            try:
+                await conn.execute(
+                    "UPDATE messages SET attachments = $1 WHERE id = $2",
+                    asyncpg.types.pgjsonb.encode(attachments),
+                    message_id
+                )
+            finally:
+                await conn.close()
+                conn = None
+        except Exception as e:
+            # If file save or DB update fails, clean up
+            if conn:
+                try:
+                    await conn.execute("DELETE FROM messages WHERE id = $1", message_id)
+                    await conn.close()
+                except:
+                    pass
+            # Try to delete file if it was created
+            try:
+                if audio_path.exists():
+                    audio_path.unlink()
+            except:
+                pass
+            raise HTTPException(status_code=500, detail=f"Failed to save audio file: {str(e)}")
+        
+        # Get updated message
+        message = await get_message_by_id(message_id)
+        
+        # Broadcast via WebSocket
+        from api.routes.websocket import send_chat_message_event
+        await send_chat_message_event(chat_id, message)
+        
+        return {
+            "success": True,
+            "message_id": message_id,
+            "audio_url": audio_url
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading voice message: {str(e)}")
+
+
+@router.post("/{chat_id}/messages/image")
+async def upload_image_message(
+    chat_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    image: UploadFile = File(..., description="Image file"),
+    message_text: Optional[str] = Query("", description="Optional message text")
+):
+    """
+    Upload an image message to a chat.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        user_role = user.get('role', 'client')
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Verify sender is participant
+        client_id = chat.get('client_id')
+        operator_id = chat.get('operator_id')
+        allowed_users = [client_id]
+        if operator_id:
+            allowed_users.append(operator_id)
+        
+        if user_id not in allowed_users:
+            raise HTTPException(status_code=403, detail="User is not a participant in this chat")
+        
+        # Validate image file
+        if image.content_type not in ALLOWED_IMAGE_FORMATS:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid image format. Allowed: {', '.join(ALLOWED_IMAGE_FORMATS)}"
+            )
+        
+        # Read image file
+        image_data = await image.read()
+        image_size = len(image_data)
+        
+        if image_size > MAX_IMAGE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image file too large. Maximum size: {MAX_IMAGE_SIZE / (1024 * 1024)}MB"
+            )
+        
+        if image_size == 0:
+            raise HTTPException(status_code=400, detail="Image file is empty")
+        
+        # Determine file extension
+        content_type_to_ext = {
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/png": "png",
+            "image/gif": "gif",
+            "image/webp": "webp"
+        }
+        file_ext = content_type_to_ext.get(image.content_type, "jpg")
+        
+        # Determine sender_type based on role
+        if user_role in ('callcenter_operator', 'callcenter_supervisor'):
+            sender_type = 'operator'
+            operator_id_for_message = user_id
+        else:
+            sender_type = 'client'
+            operator_id_for_message = None
+        
+        # Create message first to get message_id
+        message_id = await create_message(
+            chat_id=chat_id,
+            sender_id=user_id,
+            sender_type=sender_type,
+            message_text=message_text.strip() if message_text else "",
+            operator_id=operator_id_for_message,
+            attachments=None
+        )
+        
+        if not message_id:
+            raise HTTPException(status_code=500, detail="Failed to create message")
+        
+        # Save image file and update message
+        image_dir = Path(settings.MEDIA_ROOT) / "images" / str(chat_id)
+        image_dir.mkdir(parents=True, exist_ok=True)
+        
+        image_filename = f"{message_id}.{file_ext}"
+        image_path = image_dir / image_filename
+        
+        image_url = f"/api/media/images/{chat_id}/{image_filename}"
+        attachments = {
+            "type": "image",
+            "url": image_url,
+            "filename": image_filename,
+            "size": image_size,
+            "width": None,
+            "height": None
+        }
+        
+        # Save file and update database
+        import asyncpg
+        conn = None
+        try:
+            # Save image file first
+            with open(image_path, "wb") as f:
+                f.write(image_data)
+            
+            # Update message with image attachment
+            conn = await asyncpg.connect(settings.DB_URL)
+            try:
+                await conn.execute(
+                    "UPDATE messages SET attachments = $1 WHERE id = $2",
+                    asyncpg.types.pgjsonb.encode(attachments),
+                    message_id
+                )
+            finally:
+                await conn.close()
+                conn = None
+        except Exception as e:
+            # If file save or DB update fails, clean up
+            if conn:
+                try:
+                    await conn.execute("DELETE FROM messages WHERE id = $1", message_id)
+                    await conn.close()
+                except:
+                    pass
+            # Try to delete file if it was created
+            try:
+                if image_path.exists():
+                    image_path.unlink()
+            except:
+                pass
+            raise HTTPException(status_code=500, detail=f"Failed to save image file: {str(e)}")
+        
+        # Get updated message
+        message = await get_message_by_id(message_id)
+        
+        # Broadcast via WebSocket
+        from api.routes.websocket import send_chat_message_event
+        await send_chat_message_event(chat_id, message)
+        
+        return {
+            "success": True,
+            "message_id": message_id,
+            "image_url": image_url
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading image message: {str(e)}")
+
+
+@router.get("/{chat_id}/media")
+async def get_chat_media_endpoint(
+    chat_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    media_type: Optional[str] = Query(None, description="Media type filter: 'image', 'video', or None for all"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of media items")
+):
+    """
+    Get media files (images/videos) from a chat.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        user_role = user.get('role', 'client')
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Check access
+        chat_client_id = chat.get('client_id')
+        chat_operator_id = chat.get('operator_id')
+        
+        has_access = False
+        if user_role == 'client' and chat_client_id == user_id:
+            has_access = True
+        elif user_role in ('callcenter_operator', 'callcenter_supervisor'):
+            if user_role == 'callcenter_supervisor' or chat_operator_id == user_id:
+                has_access = True
+        
+        if not has_access:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Validate media_type
+        if media_type and media_type not in ('image', 'video'):
+            raise HTTPException(status_code=400, detail="Invalid media_type. Use 'image', 'video', or omit for all")
+        
+        # Get media messages
+        media_messages = await get_chat_media(chat_id, media_type, limit)
+        
+        # Convert datetime objects to strings
+        for msg in media_messages:
+            if msg.get('created_at'):
+                msg['created_at'] = msg['created_at'].isoformat()
+        
+        return {"media": media_messages, "count": len(media_messages)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching media: {str(e)}")
+
+
+class EditMessageRequest(BaseModel):
+    message_text: str
+
+
+@router.put("/{chat_id}/messages/{message_id}")
+async def edit_message_endpoint(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID"),
+    request: EditMessageRequest = Body(...)
+):
+    """
+    Edit a message. Only the message owner can edit it within 15 minutes.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Validate message text
+        if not request.message_text or not request.message_text.strip():
+            raise HTTPException(status_code=400, detail="Message text cannot be empty")
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Edit message
+        updated_message = await edit_message(message_id, request.message_text.strip(), user_id)
+        
+        if not updated_message:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot edit message. Either you are not the owner, the time limit (15 minutes) has passed, or the message does not exist."
+            )
+        
+        # Broadcast via WebSocket
+        from api.routes.websocket import send_chat_message_event
+        await send_chat_message_event(chat_id, updated_message, event_type="message.edited")
+        
+        return {
+            "success": True,
+            "message": updated_message
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error editing message: {str(e)}")
+
+
+@router.post("/{chat_id}/pin")
+async def pin_chat_endpoint(
+    chat_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Pin a chat for a user.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Pin chat
+        success = await pin_chat(user_id, chat_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to pin chat")
+        
+        return {"success": True, "message": "Chat pinned successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error pinning chat: {str(e)}")
+
+
+@router.delete("/{chat_id}/pin")
+async def unpin_chat_endpoint(
+    chat_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Unpin a chat for a user.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Unpin chat
+        success = await unpin_chat(user_id, chat_id)
+        
+        if not success:
+            raise HTTPException(status_code=404, detail="Chat is not pinned")
+        
+        return {"success": True, "message": "Chat unpinned successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error unpinning chat: {str(e)}")
+
+
+@router.get("/pinned")
+async def get_pinned_chats_endpoint(
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get all pinned chats for a user.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Get pinned chats
+        pinned_chats = await get_pinned_chats(user_id)
+        
+        return {"pinned_chats": pinned_chats, "count": len(pinned_chats)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching pinned chats: {str(e)}")
+
+
+@router.post("/{chat_id}/messages/{message_id}/read")
+async def mark_message_read_endpoint(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Mark a message as read.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Verify message exists and belongs to chat
+        message = await get_message_by_id(message_id)
+        if not message or message.get('chat_id') != chat_id:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        # Don't mark own messages as read
+        message_sender_id = message.get('sender_id')
+        if message_sender_id == user_id:
+            return {"success": True, "message": "Cannot mark own message as read"}
+        
+        # Mark as read
+        success = await mark_message_read(message_id, user_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to mark message as read")
+        
+        # Broadcast via WebSocket
+        from api.routes.websocket import send_message_read_event
+        await send_message_read_event(chat_id, message_id, user_id)
+        
+        return {"success": True, "message": "Message marked as read"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking message as read: {str(e)}")
+
+
+@router.get("/{chat_id}/messages/{message_id}/reads")
+async def get_message_reads_endpoint(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get list of users who read a message.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Verify message exists and belongs to chat
+        message = await get_message_by_id(message_id)
+        if not message or message.get('chat_id') != chat_id:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        # Get reads
+        reads = await get_message_reads(message_id)
+        
+        return {"reads": reads, "count": len(reads)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching message reads: {str(e)}")
+
+
+@router.post("/{chat_id}/read")
+async def mark_chat_read_endpoint(
+    chat_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Mark all unread messages in a chat as read.
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user.get('id')
+        
+        # Verify chat exists
+        chat = await get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Mark all messages as read
+        count = await mark_chat_messages_read(chat_id, user_id)
+        
+        return {"success": True, "count": count, "message": f"Marked {count} messages as read"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking chat as read: {str(e)}")
+
+
+@router.get("/{chat_id}/messages/{message_id}/thread")
+async def get_message_thread_endpoint(
+    chat_id: int,
+    message_id: int,
+    telegram_id: int = Query(..., description="Telegram user ID")
+):
+    """
+    Get all replies to a specific message (thread).
+    """
+    try:
+        # Get user
+        user = await get_user_by_telegram_id(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Verify message exists and belongs to chat
+        message = await get_message_by_id(message_id)
+        if not message or message.get('chat_id') != chat_id:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        # Get thread messages
+        thread_messages = await get_message_thread(message_id)
+        
+        # Convert datetime objects to strings
+        for msg in thread_messages:
+            if msg.get('created_at'):
+                msg['created_at'] = msg['created_at'].isoformat()
+            if msg.get('edited_at'):
+                msg['edited_at'] = msg['edited_at'].isoformat()
+        
+        return {"messages": thread_messages, "count": len(thread_messages)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching thread: {str(e)}")
 

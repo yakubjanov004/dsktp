@@ -6,6 +6,8 @@ import type { Message } from "../../lib/api"
 import MessageBubble from "./MessageBubble"
 import InputBar from "./InputBar"
 import ChatHeader from "./ChatHeader"
+import ChatSearch from "./ChatSearch"
+import MediaGallery from "./MediaGallery"
 
 interface ChatSession {
   id: string
@@ -19,6 +21,9 @@ interface ChatSession {
   lastMessage: Message | null
   clientName?: string
   operatorName?: string | null
+  pinned_at?: string | null
+  position?: number | null
+  isPinned?: boolean
 }
 
 interface ChatWindowProps {
@@ -48,12 +53,15 @@ export default function ChatWindow({
   isLoadingMessages = false,
   isSupervisorView = false,
 }: ChatWindowProps) {
-  const { users, sendMessage, sendStaffMessage, closeChat, typingUsers } = useChat()
+  const { users, sendMessage, sendStaffMessage, closeChat, typingUsers, sendTyping, telegramId, pinChat, unpinChat } = useChat()
   const [showScrollButton, setShowScrollButton] = useState(false)
   const [showScrollToTopButton, setShowScrollToTopButton] = useState(false)
   const [showCloseConfirm, setShowCloseConfirm] = useState(false)
+  const [showSearch, setShowSearch] = useState(false)
+  const [showMediaGallery, setShowMediaGallery] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesContainerRef = useRef<HTMLDivElement>(null)
+  const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map())
 
   // Convert currentUserId to number if it's a string
   const currentUserIdNum = typeof currentUserId === "string" ? parseInt(currentUserId) : currentUserId
@@ -124,6 +132,45 @@ export default function ChatWindow({
     }
   }
 
+  const handleSendVoice = async (audioFile: File) => {
+    if (!telegramId) return
+
+    try {
+      const { uploadVoiceMessage } = await import("../../lib/api")
+      const chatIdNum = parseInt(chat.id)
+      const result = await uploadVoiceMessage(chatIdNum, audioFile, telegramId)
+      
+      if (result?.success) {
+        // Message will be received via WebSocket
+        scrollToBottom(true)
+      }
+    } catch (error) {
+      console.error("Error sending voice message:", error)
+    }
+  }
+
+  const handleSendImage = async (imageFile: File, messageText?: string) => {
+    if (!telegramId) return
+
+    try {
+      const { uploadImageMessage } = await import("../../lib/api")
+      const chatIdNum = parseInt(chat.id)
+      const result = await uploadImageMessage(chatIdNum, imageFile, telegramId, messageText)
+      
+      if (result?.success) {
+        // Message will be received via WebSocket
+        scrollToBottom(true)
+        
+        // Add haptic feedback if available
+        if ((window as any).Telegram?.WebApp?.HapticFeedback) {
+          (window as any).Telegram.WebApp.HapticFeedback.impactOccurred("light")
+        }
+      }
+    } catch (error) {
+      console.error("Error sending image message:", error)
+    }
+  }
+
   const handleCloseChat = () => {
     // Show confirmation modal first
     setShowCloseConfirm(true)
@@ -138,6 +185,28 @@ export default function ChatWindow({
 
   const cancelCloseChat = () => {
     setShowCloseConfirm(false)
+  }
+
+  const handleSelectSearchMessage = (messageId: number) => {
+    const scrollToMessage = (element: HTMLDivElement) => {
+      element.scrollIntoView({ behavior: "smooth", block: "center" })
+      element.classList.add("bg-yellow-100")
+      setTimeout(() => element.classList.remove("bg-yellow-100"), 2000)
+    }
+
+    const messageElement = messageRefs.current.get(messageId)
+    if (messageElement) {
+      scrollToMessage(messageElement)
+    } else {
+      // Message not loaded yet, scroll to bottom and retry
+      scrollToBottom(false)
+      setTimeout(() => {
+        const retryElement = messageRefs.current.get(messageId)
+        if (retryElement) {
+          scrollToMessage(retryElement)
+        }
+      }, 500)
+    }
   }
 
   // Handle ESC key to close modal
@@ -180,6 +249,65 @@ export default function ChatWindow({
         }, 50)
       })
     }
+  }, [chat.messages])
+
+  // Mark messages as read when they are visible (only for messages from other users)
+  const markedMessageIdsRef = useRef<Set<number>>(new Set())
+  
+  useEffect(() => {
+    if (!telegramId || !chat.messages || chat.messages.length === 0) return
+
+    // Reset marked messages when chat changes
+    if (markedMessageIdsRef.current.size > 0) {
+      markedMessageIdsRef.current.clear()
+    }
+
+    const { markMessageRead } = require("../../lib/api")
+    let readTimeout: NodeJS.Timeout | null = null
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            const messageId = parseInt(entry.target.getAttribute("data-message-id") || "0")
+            const isOwnMessage = entry.target.getAttribute("data-is-own") === "true"
+            
+            // Only mark messages from other users as read
+            if (messageId > 0 && !isOwnMessage && !markedMessageIdsRef.current.has(messageId)) {
+              markedMessageIdsRef.current.add(messageId)
+              
+              // Debounce read marking
+              if (readTimeout) clearTimeout(readTimeout)
+              readTimeout = setTimeout(() => {
+                markMessageRead(parseInt(chat.id), messageId, telegramId).catch(console.error)
+              }, 500)
+            }
+          }
+        })
+      },
+      { threshold: 0.5 }
+    )
+
+    // Observe all message elements
+    const messageElements = messagesContainerRef.current?.querySelectorAll("[data-message-id]")
+    messageElements?.forEach((el) => observer.observe(el))
+
+    return () => {
+      if (readTimeout) clearTimeout(readTimeout)
+      messageElements?.forEach((el) => observer.unobserve(el))
+      observer.disconnect()
+    }
+  }, [chat.messages, chat.id, telegramId])
+
+  // Cleanup message refs when messages change
+  useEffect(() => {
+    const currentMessageIds = new Set(chat.messages.map(m => m.id))
+    // Remove refs for messages that no longer exist
+    messageRefs.current.forEach((_, messageId) => {
+      if (!currentMessageIds.has(messageId)) {
+        messageRefs.current.delete(messageId)
+      }
+    })
   }, [chat.messages])
 
   const windowClass = isFloating
@@ -245,6 +373,11 @@ export default function ChatWindow({
           isDarkMode={false}
           isReadOnly={isReadOnly}
           isCompact={isCompact || isFloating}
+          onSearch={() => setShowSearch(true)}
+          onMediaGallery={() => setShowMediaGallery(true)}
+          isPinned={chat.isPinned || !!chat.pinned_at}
+          onPinChat={() => pinChat(chat.id)}
+          onUnpinChat={() => unpinChat(chat.id)}
         />
       </div>
 
@@ -336,15 +469,23 @@ export default function ChatWindow({
               }
               
               return (
-                <MessageBubble
+                <div
                   key={message.id || `msg-${index}-${message.created_at}`}
-                  message={message}
-                  isOwnMessage={isOwnMessage}
-                  isDarkMode={false}
-                  isNew={index === chat.messages.length - 1}
-                  senderName={senderName}
-                  showSenderName={isSupervisorView && !isStaffChat}
-                />
+                  ref={(el) => {
+                    if (el && message.id) {
+                      messageRefs.current.set(message.id, el)
+                    }
+                  }}
+                >
+                  <MessageBubble
+                    message={message}
+                    isOwnMessage={isOwnMessage}
+                    isDarkMode={false}
+                    isNew={index === chat.messages.length - 1}
+                    senderName={senderName}
+                    showSenderName={isSupervisorView && !isStaffChat}
+                  />
+                </div>
               )
             })
           ) : (
@@ -407,10 +548,35 @@ export default function ChatWindow({
 
         {/* Input Bar */}
         {!isReadOnly && (
-          <InputBar onSendMessage={handleSendMessage} isDarkMode={false} isCompact={isCompact || isFloating} />
+          <InputBar 
+            onSendMessage={handleSendMessage}
+            onSendVoice={handleSendVoice}
+            onSendImage={handleSendImage}
+            onTyping={(isTyping) => sendTyping(chat.id, isTyping)}
+            isDarkMode={false} 
+            isCompact={isCompact || isFloating}
+          />
         )}
       </div>
     </div>
+
+      {/* Search Modal */}
+      <ChatSearch
+        chatId={chat.id}
+        isOpen={showSearch}
+        onClose={() => setShowSearch(false)}
+        onSelectMessage={handleSelectSearchMessage}
+      />
+
+      {/* Media Gallery Modal */}
+      {telegramId && (
+        <MediaGallery
+          chatId={chat.id}
+          telegramId={telegramId}
+          isOpen={showMediaGallery}
+          onClose={() => setShowMediaGallery(false)}
+        />
+      )}
     </>
   )
 }

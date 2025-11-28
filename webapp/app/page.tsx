@@ -314,7 +314,12 @@ export default function App() {
       }
     };
 
-    // Telegram SDK MUST be available
+    // Check if we're in development mode (telegram_id param present)
+    const urlParams = new URLSearchParams(window.location.search)
+    const devTelegramId = urlParams.get('telegram_id')
+    const isInTelegram = Boolean(window.Telegram?.WebApp?.initData)
+    const isDevelopment = !isInTelegram && !!devTelegramId
+    
     // Use a flag to prevent multiple initializations
     let initialized = false
     
@@ -324,6 +329,15 @@ export default function App() {
         return
       }
       
+      // In development mode, skip SDK check and initialize immediately
+      if (isDevelopment) {
+        console.log("🧪 [DEV MODE] Skipping Telegram SDK check, initializing directly...")
+        initialized = true
+        initializeApp()
+        return
+      }
+      
+      // In production (Telegram), wait for SDK
       if (window.Telegram?.WebApp) {
         initialized = true
         initializeApp()

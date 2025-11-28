@@ -2,9 +2,12 @@
 Chat queries for WebApp
 """
 import asyncpg
+import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 
 async def create_chat(client_id: int, operator_id: Optional[int] = None) -> Dict[str, Any]:
@@ -86,17 +89,20 @@ async def get_user_chats(user_id: int, role: str, status: Optional[str] = None) 
                     c.*,
                     client.full_name as client_name,
                     client.telegram_id as client_telegram_id,
-                    operator.full_name as operator_name
+                    operator.full_name as operator_name,
+                    pc.pinned_at,
+                    pc.position
                 FROM chats c
                 LEFT JOIN users client ON c.client_id = client.id
                 LEFT JOIN users operator ON c.operator_id = operator.id
+                LEFT JOIN pinned_chats pc ON pc.chat_id = c.id AND pc.user_id = $1
                 WHERE c.client_id = $1
             """
             params = [user_id]
             if status:
                 query += " AND c.status = $2"
                 params.append(status)
-            query += " ORDER BY c.last_activity_at DESC"
+            query += " ORDER BY pc.position ASC NULLS LAST, c.last_activity_at DESC"
         elif role == 'callcenter_supervisor':
             # Supervisors see all chats
             query = """
@@ -121,17 +127,20 @@ async def get_user_chats(user_id: int, role: str, status: Optional[str] = None) 
                     c.*,
                     client.full_name as client_name,
                     client.telegram_id as client_telegram_id,
-                    operator.full_name as operator_name
+                    operator.full_name as operator_name,
+                    pc.pinned_at,
+                    pc.position
                 FROM chats c
                 LEFT JOIN users client ON c.client_id = client.id
                 LEFT JOIN users operator ON c.operator_id = operator.id
+                LEFT JOIN pinned_chats pc ON pc.chat_id = c.id AND pc.user_id = $1
                 WHERE c.operator_id = $1
             """
             params = [user_id]
             if status:
                 query += " AND c.status = $2"
                 params.append(status)
-            query += " ORDER BY c.last_activity_at DESC"
+            query += " ORDER BY pc.position ASC NULLS LAST, c.last_activity_at DESC"
         
         rows = await conn.fetch(query, *params)
         return [dict(r) for r in rows]
@@ -441,6 +450,98 @@ async def get_active_chat_counts() -> Dict[str, Any]:
             "inbox_count": inbox_count['cnt'] if inbox_count else 0,
             "operator_counts": [{"operator_id": r['operator_id'], "cnt": r['cnt']} for r in operator_counts]
         }
+    finally:
+        await conn.close()
+
+
+async def pin_chat(user_id: int, chat_id: int) -> bool:
+    """
+    Pin a chat for a user. If already pinned, update position.
+    Returns True if successful, False otherwise.
+    """
+    conn = await asyncpg.connect(settings.DB_URL)
+    try:
+        # Get current max position for this user
+        max_position = await conn.fetchval(
+            """
+            SELECT COALESCE(MAX(position), -1) 
+            FROM pinned_chats 
+            WHERE user_id = $1
+            """,
+            user_id
+        )
+        new_position = max_position + 1
+        
+        # Insert or update (UPSERT)
+        await conn.execute(
+            """
+            INSERT INTO pinned_chats (user_id, chat_id, position, pinned_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (user_id, chat_id) 
+            DO UPDATE SET 
+                position = $3,
+                pinned_at = now(),
+                updated_at = now()
+            """,
+            user_id, chat_id, new_position
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Error pinning chat: {e}")
+        return False
+    finally:
+        await conn.close()
+
+
+async def unpin_chat(user_id: int, chat_id: int) -> bool:
+    """
+    Unpin a chat for a user.
+    Returns True if successful, False otherwise.
+    """
+    conn = await asyncpg.connect(settings.DB_URL)
+    try:
+        result = await conn.execute(
+            """
+            DELETE FROM pinned_chats
+            WHERE user_id = $1 AND chat_id = $2
+            """,
+            user_id, chat_id
+        )
+        return result == "DELETE 1"
+    except Exception as e:
+        logger.error(f"Error unpinning chat: {e}")
+        return False
+    finally:
+        await conn.close()
+
+
+async def get_pinned_chats(user_id: int) -> List[Dict[str, Any]]:
+    """
+    Get all pinned chats for a user, ordered by position.
+    Returns list of chat dictionaries with pinned_at and position.
+    """
+    conn = await asyncpg.connect(settings.DB_URL)
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT 
+                c.*,
+                pc.pinned_at,
+                pc.position,
+                u.full_name as client_name,
+                u.telegram_id as client_telegram_id,
+                op.full_name as operator_name,
+                op.telegram_id as operator_telegram_id
+            FROM pinned_chats pc
+            INNER JOIN chats c ON pc.chat_id = c.id
+            LEFT JOIN users u ON c.client_id = u.id
+            LEFT JOIN users op ON c.operator_id = op.id
+            WHERE pc.user_id = $1
+            ORDER BY pc.position ASC, pc.pinned_at ASC
+            """,
+            user_id
+        )
+        return [dict(row) for row in rows]
     finally:
         await conn.close()
 

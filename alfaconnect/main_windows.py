@@ -13,6 +13,7 @@ import signal
 import atexit
 import time
 import socket
+import webbrowser
 from pathlib import Path
 
 from config import settings
@@ -127,7 +128,7 @@ def run_ngrok_tunnels() -> tuple[str | None, str | None]:
         # Ngrok tunnels ishga tushirish (config fayli orqali)
         logger.info(f"Starting ngrok tunnels from config: {ngrok_config_path}")
         ngrok_process = subprocess.Popen(
-            ["ngrok", "start", "--all", "--config", str(ngrok_config_path)],
+            ["ngrok", "start", "--all", "--config", str(ngrok_config_path), "--log=stdout"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -615,10 +616,38 @@ async def main():
             logger.info(f"   - API Docs: {BACKEND_HTTP_URL}/docs")
             logger.info("=" * 60)
             logger.info("")
+            
+            # Webapp interfeysini avtomatik ochish (localhost:3200 ga)
+            try:
+                local_webapp_url = f"http://localhost:{WEBAPP_PORT}"
+                logger.info(f"🌐 Opening webapp in browser: {local_webapp_url}")
+                webbrowser.open(local_webapp_url)
+                logger.info("✅ Webapp opened in browser")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not open browser automatically: {e}")
+                logger.info(f"   Please open manually: http://localhost:{WEBAPP_PORT}")
         else:
             logger.warning("⚠️ Ngrok tunnels could not be created. Using local URLs.")
+            # Webapp interfeysini avtomatik ochish (localhost:3200 ga)
+            try:
+                local_webapp_url = f"http://localhost:{WEBAPP_PORT}"
+                logger.info(f"🌐 Opening webapp in browser: {local_webapp_url}")
+                webbrowser.open(local_webapp_url)
+                logger.info("✅ Webapp opened in browser")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not open browser automatically: {e}")
+                logger.info(f"   Please open manually: http://localhost:{WEBAPP_PORT}")
     else:
         logger.info("ℹ️ Ngrok is disabled. Using local URLs only.")
+        # Webapp interfeysini avtomatik ochish (localhost:3200 ga)
+        try:
+            local_webapp_url = f"http://localhost:{WEBAPP_PORT}"
+            logger.info(f"🌐 Opening webapp in browser: {local_webapp_url}")
+            webbrowser.open(local_webapp_url)
+            logger.info("✅ Webapp opened in browser")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not open browser automatically: {e}")
+            logger.info(f"   Please open manually: http://localhost:{WEBAPP_PORT}")
     
     # Server qayta ishga tushganda material recovery
     try:

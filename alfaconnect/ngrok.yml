@@ -6,9 +6,21 @@ tunnels:
     addr: 8001
     proto: http
     inspect: true
+    request_header:
+      add:
+        - "ngrok-skip-browser-warning: true"
+    response_header:
+      add:
+        - "ngrok-skip-browser-warning: true"
   
   frontend:
     addr: 3200
     proto: http
     inspect: true
+    request_header:
+      add:
+        - "ngrok-skip-browser-warning: true"
+    response_header:
+      add:
+        - "ngrok-skip-browser-warning: true"
 

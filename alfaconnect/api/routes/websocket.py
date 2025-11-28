@@ -305,11 +305,27 @@ async def send_chat_inactive_event(chat_id: int, chat: Optional[dict] = None):
     await _broadcast_global_event(event)
 
 
-async def send_chat_message_event(chat_id: int, message: Dict[str, Any]):
+async def send_message_read_event(chat_id: int, message_id: int, user_id: int):
     """
-    Send chat.message event when a new message is created.
+    Send message read event via WebSocket.
+    Broadcasts to all chat participants.
+    Event: { type: "message.read", chat_id: int, message_id: int, user_id: int }
+    """
+    try:
+        await chat_ws_manager.emit(
+            chat_id,
+            "message.read",
+            {"message_id": message_id, "user_id": user_id}
+        )
+    except Exception as e:
+        logger.warning(f"send_message_read_event: Error broadcasting via chat manager: {e}")
+
+
+async def send_chat_message_event(chat_id: int, message: Dict[str, Any], event_type: str = "message.new"):
+    """
+    Send chat message event (new or edited).
     Broadcasts to both old WebSocket endpoint (/ws/chat/{chat_id}) and new endpoint (/ws/chat?chat_id=...)
-    Event: { type: "chat.message", chat_id: int, message: {...} }
+    Event: { type: "message.new" | "message.edited", chat_id: int, message: {...} }
     """
     # Convert datetime objects to ISO format strings for JSON serialization
     serialized_message = {}
@@ -336,7 +352,7 @@ async def send_chat_message_event(chat_id: int, message: Dict[str, Any]):
     try:
         await chat_ws_manager.emit(
             chat_id,
-            "message.new",
+            event_type,
             serialized_message
         )
         logger.info(f"send_chat_message_event: Broadcasted via chat manager for chat {chat_id}")
@@ -345,6 +361,36 @@ async def send_chat_message_event(chat_id: int, message: Dict[str, Any]):
     
     await _broadcast_global_event(global_event)
     logger.info(f"send_chat_message_event: Sent to {len(global_connections)} global connections")
+
+
+async def send_message_reaction_event(chat_id: int, message_id: int, user_id: int, emoji: str, action: str):
+    """
+    Send message.reaction event when a reaction is added or removed.
+    Event: { type: "message.reaction", chat_id: int, message_id: int, user_id: int, emoji: str, action: "added"|"removed" }
+    """
+    event = {
+        "type": "message.reaction",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "user_id": user_id,
+        "emoji": emoji,
+        "action": action
+    }
+    
+    logger.info(f"send_message_reaction_event: Broadcasting reaction for chat {chat_id}, message {message_id}, user {user_id}, emoji {emoji}, action {action}")
+    
+    try:
+        await chat_ws_manager.emit(
+            chat_id,
+            "message.reaction",
+            event
+        )
+        logger.info(f"send_message_reaction_event: Broadcasted via chat manager for chat {chat_id}")
+    except Exception as e:
+        logger.warning(f"send_message_reaction_event: Error broadcasting via chat manager: {e}")
+    
+    await _broadcast_global_event(event)
+    logger.info(f"send_message_reaction_event: Sent to {len(global_connections)} global connections")
 
 
 async def send_stats_changed_event(inbox_count: int, operator_counts: List[Dict[str, Any]]):

@@ -9,18 +9,58 @@ import { buildNgrokBypassHeaders, normalizeBaseUrl } from "./network"
 
 // Use relative path - Next.js rewrites will proxy /api/* to backend
 // Works for both localhost and Ngrok domain
-let API_BASE = normalizeBaseUrl(process.env.NEXT_PUBLIC_API_BASE || "/api") || "/api"
+// IMPORTANT: Always use relative path /api for client-side requests
+// Next.js rewrites will handle proxying to backend (server-side)
+let API_BASE = "/api"  // Always use relative path, rewrites handle backend routing
 
 function setApiBase(newBase?: string | null) {
-  const normalized = normalizeBaseUrl(newBase) || "/api"
-  if (API_BASE !== normalized) {
-    console.log(`[api] Updating API_BASE -> ${normalized}`)
-    API_BASE = normalized
+  // IMPORTANT: Always keep API_BASE as relative path "/api"
+  // Next.js rewrites will handle proxying to backend
+  // We don't update API_BASE even if runtime config provides full URL
+  // This ensures all client-side requests use relative paths
+  if (newBase && newBase !== "/api") {
+    console.log(`[api] Runtime config provided: ${newBase}, but keeping API_BASE as "/api" for relative paths`)
   }
+  // Always keep as "/api" - rewrites handle backend routing
+  API_BASE = "/api"
 }
 
 function getApiBase(): string {
   return API_BASE || "/api"
+}
+
+/**
+ * Check if backend server is running
+ * Returns true if backend responds to health check
+ */
+export async function checkBackendHealth(): Promise<boolean> {
+  try {
+    const healthUrl = `${getApiBase()}/health`
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
+    
+    const response = await fetch(healthUrl, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: mergeHeaders(),
+    })
+    
+    clearTimeout(timeoutId)
+    
+    if (response.ok) {
+      const data = await response.json().catch(() => ({}))
+      console.log(`[checkBackendHealth] ✅ Backend is running`, data)
+      return true
+    } else {
+      console.warn(`[checkBackendHealth] ⚠️ Backend health check returned HTTP ${response.status}`)
+      return false
+    }
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    console.error(`[checkBackendHealth] ❌ Backend health check failed: ${errorMsg}`)
+    console.error(`[checkBackendHealth] 💡 Hint: Backend server might not be running. Please start the backend server on port 8001.`)
+    return false
+  }
 }
 
 // API request timeout (30 seconds)
@@ -69,21 +109,93 @@ function mergeHeaders(headersInit?: HeadersInit): Headers {
  */
 async function apiFetch(url: string, options: RequestInit = {}, retries = MAX_RETRIES): Promise<Response> {
   const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT)
-  const { headers: optionHeaders, ...restOptions } = options
+  let timeoutAborted = false
+  const timeoutId = setTimeout(() => {
+    timeoutAborted = true
+    controller.abort()
+  }, API_TIMEOUT)
+  
+  const { headers: optionHeaders, signal: externalSignal, ...restOptions } = options
   const headers = mergeHeaders(optionHeaders)
+  
+  // Combine external signal with our timeout signal
+  let combinedSignal: AbortSignal | undefined
+  if (externalSignal) {
+    // If external signal is provided, abort our controller when external signal aborts
+    externalSignal.addEventListener('abort', () => {
+      if (!timeoutAborted) {
+        controller.abort()
+      }
+    })
+    combinedSignal = controller.signal
+  } else {
+    combinedSignal = controller.signal
+  }
   
   try {
     console.log(`[apiFetch] Requesting: ${url}`)
     const response = await fetch(url, {
       ...restOptions,
-      signal: controller.signal,
+      signal: combinedSignal,
       headers,
     })
     
     clearTimeout(timeoutId)
     
     console.log(`[apiFetch] Response status: ${response.status} for ${url}`)
+    
+    // Handle 404 errors - might indicate backend not running or endpoint missing
+    if (response.status === 404) {
+      // Read error text but don't expose it in UI - just log it
+      const errorText = await response.clone().text().catch(() => 'Unable to read error')
+      let errorDetail = 'Not Found'
+      try {
+        const errorJson = JSON.parse(errorText)
+        errorDetail = errorJson.detail || errorText
+      } catch {
+        errorDetail = errorText
+      }
+      
+      // Check backend health if we get 404 (only in development for debugging)
+      if (process.env.NODE_ENV === 'development') {
+        try {
+          const healthCheck = await fetch(`${getApiBase()}/health`, { 
+            method: 'GET',
+            signal: AbortSignal.timeout(5000) // 5 second timeout for health check
+          }).catch(() => null)
+          
+          if (!healthCheck || !healthCheck.ok) {
+            console.error(`[apiFetch] ❌ 404 Not Found + Backend health check failed`, {
+              url,
+              endpoint: url.replace(getApiBase(), ''),
+              backendStatus: healthCheck ? `HTTP ${healthCheck.status}` : 'No response',
+              hint: "⚠️ Backend server might not be running! Please check if backend server is started on port 8001."
+            })
+          } else {
+            console.error(`[apiFetch] ❌ 404 Not Found (backend is running but endpoint missing)`, {
+              url,
+              endpoint: url.replace(getApiBase(), ''),
+              errorDetail,
+              hint: "Backend is running but this specific endpoint doesn't exist. Check endpoint path."
+            })
+          }
+        } catch (healthError) {
+          console.error(`[apiFetch] ❌ 404 Not Found + Could not check backend health`, {
+            url,
+            endpoint: url.replace(getApiBase(), ''),
+            healthCheckError: healthError instanceof Error ? healthError.message : String(healthError),
+            hint: "⚠️ Backend server might not be running! Please check if backend server is started on port 8001."
+          })
+        }
+      } else {
+        // In production, just log the error without health check
+        console.error(`[apiFetch] ❌ 404 Not Found for endpoint: ${url.replace(getApiBase(), '')}`)
+      }
+      
+      // Don't retry 404s - they indicate a real problem
+      // Return response but the caller should handle it gracefully
+      return response
+    }
     
     // Retry on 5xx errors or connection errors
     if (!response.ok && response.status >= 500 && retries > 0) {
@@ -96,6 +208,18 @@ async function apiFetch(url: string, options: RequestInit = {}, retries = MAX_RE
     return response
   } catch (error) {
     clearTimeout(timeoutId)
+    
+    // Handle abort errors more gracefully
+    if (error instanceof Error && error.name === 'AbortError') {
+      // If it was a timeout, throw error
+      if (timeoutAborted) {
+        throw new Error('API request timeout')
+      }
+      // If it was an external abort (component unmount, etc.), silently ignore
+      // This is common in React Strict Mode and component unmounts
+      console.log(`[apiFetch] Request aborted (likely component unmount): ${url}`)
+      throw error // Still throw, but caller can check for AbortError
+    }
     
     const errorMsg = error instanceof Error ? error.message : String(error)
     console.error(`[apiFetch] Error for ${url}: ${errorMsg}`)
@@ -110,9 +234,6 @@ async function apiFetch(url: string, options: RequestInit = {}, retries = MAX_RE
       return apiFetch(url, options, retries - 1)
     }
     
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('API request timeout')
-    }
     throw error
   }
 }
@@ -147,14 +268,18 @@ export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
   try {
     const originParam = typeof window !== 'undefined' ? window.location.origin : null
     const runtimeApiBase = getApiBase()
+    
+    // Always use relative path for /api/config - Next.js rewrites will proxy to backend
+    // This works for both localhost and ngrok URLs
     const configEndpoint = originParam 
-      ? `${runtimeApiBase}/config?origin=${encodeURIComponent(originParam)}`
-      : `${runtimeApiBase}/config`
+      ? `/api/config?origin=${encodeURIComponent(originParam)}`
+      : `/api/config`
 
     console.log("🔄 [fetchRuntimeConfig] Fetching runtime configuration...")
     console.log(`   📍 Current API_BASE: ${runtimeApiBase}`)
     console.log(`   📍 Window origin: ${originParam || 'N/A'}`)
     console.log(`   📍 Requesting: ${configEndpoint}`)
+    console.log(`   📍 Note: Using relative path, Next.js rewrites will proxy to backend`)
     
     const res = await apiFetch(configEndpoint)
     
@@ -163,12 +288,44 @@ export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
       const errorBody = await res.text()
       console.error(`[fetchRuntimeConfig] Response not OK: ${statusText}`)
       console.error(`[fetchRuntimeConfig] Response body: ${errorBody}`)
+      console.error(`[fetchRuntimeConfig] Full URL attempted: ${typeof window !== 'undefined' ? window.location.origin + configEndpoint : configEndpoint}`)
+      
+      // If 404, try direct backend connection as fallback
+      if (res.status === 404) {
+        console.warn(`[fetchRuntimeConfig] Got 404, trying direct backend connection...`)
+        const directBackendUrl = `http://127.0.0.1:8001/api/config${originParam ? `?origin=${encodeURIComponent(originParam)}` : ''}`
+        try {
+          const directRes = await apiFetch(directBackendUrl)
+          if (directRes.ok) {
+            console.log(`[fetchRuntimeConfig] ✅ Direct backend connection successful`)
+            const directConfig = await directRes.json() as RuntimeConfig
+            if (directConfig) {
+              runtimeConfig = directConfig
+              if (runtimeConfig.apiBaseUrl) {
+                console.log(`   ℹ️  Backend API URL: ${runtimeConfig.apiBaseUrl}`)
+                setApiBase("/api")  // Keep relative path for future requests
+              }
+              if (runtimeConfig.wsBaseUrl) {
+                setRuntimeWsBaseUrl(runtimeConfig.wsBaseUrl)
+              }
+              return runtimeConfig
+            }
+          }
+        } catch (directError) {
+          console.error(`[fetchRuntimeConfig] Direct backend connection also failed:`, directError)
+        }
+      }
+      
       throw new Error(`Failed to fetch config: ${statusText}`)
     }
     
     runtimeConfig = await res.json()
+    // Don't update API_BASE - keep it as "/api" for relative paths
+    // Next.js rewrites will handle proxying to backend
+    // We only use runtimeConfig.apiBaseUrl for logging/info, not for actual requests
     if (runtimeConfig?.apiBaseUrl) {
-      setApiBase(runtimeConfig.apiBaseUrl)
+      console.log(`   ℹ️  Backend API URL: ${runtimeConfig.apiBaseUrl} (using relative /api for requests)`)
+      setApiBase("/api")  // Explicitly keep relative path
     }
     if (runtimeConfig?.wsBaseUrl) {
       setRuntimeWsBaseUrl(runtimeConfig.wsBaseUrl)
@@ -185,17 +342,45 @@ export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error)
     console.error("❌ [fetchRuntimeConfig] Failed:", errorMsg)
-    console.error("   🔄 Falling back to default values")
-    // Fallback to default API_BASE
-    const fallbackApiBase = getApiBase()
-    const fallbackWsBase = fallbackApiBase.replace(/^http/, "ws")
+    console.error("   📍 Current location:", typeof window !== 'undefined' ? window.location.href : 'N/A')
+    console.error("   📍 Is Telegram iframe:", typeof window !== 'undefined' && window.parent !== window)
+    console.error("   🔄 Falling back to localhost for development")
+    
+    // Check if we're on ngrok URL or localhost
+    const isLocalhost = typeof window !== 'undefined' && 
+      (window.location.hostname === 'localhost' || 
+       window.location.hostname === '127.0.0.1' ||
+       window.location.hostname.startsWith('192.168.'))
+    
+    const isNgrok = typeof window !== 'undefined' && 
+      (window.location.hostname.includes('ngrok') || 
+       window.location.hostname.includes('ngrok-free.dev'))
+    
+    let fallbackApiBase = getApiBase()
+    let fallbackWsBase = fallbackApiBase.replace(/^http/, "ws")
+    
+    // If ngrok URL fails or we're on localhost, use localhost backend
+    if ((isNgrok || isLocalhost) && (fallbackApiBase.includes('ngrok') || !fallbackApiBase.startsWith('http'))) {
+      console.warn("   ⚠️  Ngrok/remote backend failed, using localhost:8001")
+      fallbackApiBase = "http://127.0.0.1:8001"
+      fallbackWsBase = "ws://127.0.0.1:8001"
+    } else if (isLocalhost && fallbackApiBase.includes('ngrok')) {
+      console.warn("   ⚠️  Detected localhost but API_BASE is ngrok URL, using localhost:8001")
+      fallbackApiBase = "http://127.0.0.1:8001"
+      fallbackWsBase = "ws://127.0.0.1:8001"
+    }
+    
     runtimeConfig = {
       apiBaseUrl: fallbackApiBase,
       wsBaseUrl: fallbackWsBase,
       timestamp: new Date().toISOString(),
     }
+    // Don't update API_BASE - keep it as "/api" for relative paths
+    // setApiBase() will ensure API_BASE stays as "/api"
+    setApiBase("/api")  // Explicitly keep relative path
     setRuntimeWsBaseUrl(runtimeConfig.wsBaseUrl)
     console.log("   ⚠️  Using fallback config:", runtimeConfig)
+    console.log("   ⚠️  API_BASE kept as '/api' for relative path requests")
     return runtimeConfig
   }
 }
@@ -547,6 +732,8 @@ export interface StaffChat {
 
 export interface Chat {
   id: number
+  pinned_at?: string | null
+  position?: number | null
   client_id: number
   operator_id: number | null
   status: "active" | "inactive"
@@ -557,6 +744,12 @@ export interface Chat {
   client_name: string
   client_telegram_id: number
   operator_name: string | null
+}
+
+export interface MessageReaction {
+  emoji: string
+  count: number
+  users: number[]
 }
 
 export interface Message {
@@ -571,6 +764,19 @@ export interface Message {
   sender_name: string | null
   sender_telegram_id: number | null
   sender_role: string | null
+  reactions?: MessageReaction[]
+  forwarded_from_message_id?: number | null
+  forwarded_from_chat_id?: number | null
+  forwarded_from_user_id?: number | null
+  forwarded_from_user_name?: string | null
+  edited_at?: string | null
+  read_count?: number
+  reply_to_message_id?: number | null
+  reply_to_id?: number | null
+  reply_to_text?: string | null
+  reply_to_sender_id?: number | null
+  reply_to_sender_type?: string | null
+  reply_to_sender_name?: string | null
 }
 
 export interface ClientInfo {
@@ -701,6 +907,14 @@ export async function getChats(telegramId: number, status?: string): Promise<Cha
     const data = await res.json()
     return data.chats || []
   } catch (error) {
+    // Silently ignore aborted requests (component unmount, React Strict Mode, etc.)
+    if (error instanceof Error && (error.name === 'AbortError' || error.message === 'API request timeout')) {
+      // Only log timeout errors, not component unmount aborts
+      if (error.message === 'API request timeout') {
+        console.error("Error fetching chats: Request timeout", error)
+      }
+      return []
+    }
     console.error("Error fetching chats:", error)
     return []
   }
@@ -862,7 +1076,8 @@ export async function sendMessage(
   senderId: number,
   messageText: string,
   senderType: "client" | "operator" | "system",
-  attachments?: Record<string, any>
+  attachments?: Record<string, any>,
+  replyToMessageId?: number | null
 ): Promise<number | null> {
   try {
     const res = await apiFetch(`${API_BASE}/chat/${chatId}/messages`, {
@@ -874,11 +1089,19 @@ export async function sendMessage(
         sender_type: senderType,
         operator_id: senderType === "operator" ? senderId : null,
         attachments: attachments || null,
+        reply_to_message_id: replyToMessageId || null,
       }),
     })
     
     if (!res.ok) {
-      console.error(`Failed to send message: HTTP ${res.status}`)
+      const errorText = await res.text().catch(() => 'Unable to read error response')
+      console.error(`Failed to send message: HTTP ${res.status}`, errorText)
+      try {
+        const errorData = JSON.parse(errorText)
+        console.error("Error details:", errorData)
+      } catch {
+        console.error("Error response:", errorText)
+      }
       return null
     }
     
@@ -888,6 +1111,431 @@ export async function sendMessage(
     console.error("Error sending message:", error)
     return null
   }
+}
+
+/**
+ * Toggle a reaction on a message
+ */
+export async function toggleMessageReaction(
+  chatId: number,
+  messageId: number,
+  emoji: string,
+  telegramId: number
+): Promise<{ action: string; reactions: any[] } | null> {
+  try {
+    const res = await apiFetch(`${API_BASE}/chat/${chatId}/messages/${messageId}/reactions?telegram_id=${telegramId}`, {
+      method: "POST",
+      body: JSON.stringify({ emoji }),
+    })
+    
+    if (!res.ok) {
+      console.error(`Failed to toggle reaction: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error toggling reaction:", error)
+    return null
+  }
+}
+
+/**
+ * Get reactions for a message
+ */
+export async function getMessageReactions(
+  chatId: number,
+  messageId: number,
+  telegramId: number
+): Promise<{ reactions: any[] } | null> {
+  try {
+    const res = await apiFetch(`${API_BASE}/chat/${chatId}/messages/${messageId}/reactions?telegram_id=${telegramId}`)
+    
+    if (!res.ok) {
+      console.error(`Failed to get reactions: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error getting reactions:", error)
+    return null
+  }
+}
+
+/**
+ * Search messages in a chat
+ */
+export async function searchChatMessages(
+  chatId: number,
+  query: string,
+  telegramId: number,
+  limit: number = 50
+): Promise<{ results: Message[]; count: number } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/search?query=${encodeURIComponent(query)}&limit=${limit}&telegram_id=${telegramId}`
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to search messages: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error searching messages:", error)
+    return null
+  }
+}
+
+/**
+ * Forward a message to another chat
+ */
+export async function forwardMessage(
+  chatId: number,
+  messageId: number,
+  targetChatId: number,
+  telegramId: number
+): Promise<{ success: boolean; message_id?: number } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/messages/${messageId}/forward?telegram_id=${telegramId}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ target_chat_id: targetChatId }),
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to forward message: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error forwarding message:", error)
+    return null
+  }
+}
+
+/**
+ * Upload an image message
+ */
+export async function uploadImageMessage(
+  chatId: number,
+  imageFile: File,
+  telegramId: number,
+  messageText?: string
+): Promise<{ success: boolean; message_id?: number; image_url?: string } | null> {
+  try {
+    const formData = new FormData()
+    formData.append("image", imageFile)
+    if (messageText) {
+      formData.append("message_text", messageText)
+    }
+
+    const res = await fetch(
+      `${API_BASE}/chat/${chatId}/messages/image?telegram_id=${telegramId}`,
+      {
+        method: "POST",
+        body: formData,
+        headers: buildNgrokBypassHeaders(),
+      }
+    )
+    
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => 'Unable to read error response')
+      console.error(`Failed to upload image message: HTTP ${res.status}`, errorText)
+      try {
+        const errorData = JSON.parse(errorText)
+        console.error("Error details:", errorData)
+      } catch {
+        console.error("Error response:", errorText)
+      }
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error uploading image message:", error)
+    return null
+  }
+}
+
+/**
+ * Upload a voice message
+ */
+export async function uploadVoiceMessage(
+  chatId: number,
+  audioFile: File,
+  telegramId: number
+): Promise<{ success: boolean; message_id?: number; audio_url?: string } | null> {
+  try {
+    const formData = new FormData()
+    formData.append("audio", audioFile)
+
+    const res = await fetch(
+      `${API_BASE}/chat/${chatId}/messages/voice?telegram_id=${telegramId}`,
+      {
+        method: "POST",
+        body: formData,
+        headers: buildNgrokBypassHeaders(),
+      }
+    )
+    
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => 'Unable to read error response')
+      console.error(`Failed to upload voice message: HTTP ${res.status}`, errorText)
+      try {
+        const errorData = JSON.parse(errorText)
+        console.error("Error details:", errorData)
+      } catch {
+        console.error("Error response:", errorText)
+      }
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error uploading voice message:", error)
+    return null
+  }
+}
+
+/**
+ * Get media files from a chat
+ */
+export async function getChatMedia(
+  chatId: number,
+  telegramId: number,
+  mediaType?: "image" | "video",
+  limit: number = 50
+): Promise<{ media: Message[]; count: number } | null> {
+  try {
+    const params = new URLSearchParams({
+      telegram_id: telegramId.toString(),
+      limit: limit.toString(),
+    })
+    if (mediaType) {
+      params.append("media_type", mediaType)
+    }
+
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/media?${params.toString()}`,
+      { method: "GET" }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to get chat media: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error getting chat media:", error)
+    return null
+  }
+}
+
+/**
+ * Edit a message
+ */
+export async function editMessage(
+  chatId: number,
+  messageId: number,
+  newText: string,
+  telegramId: number
+): Promise<{ success: boolean; message?: Message } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/messages/${messageId}?telegram_id=${telegramId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ message_text: newText }),
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to edit message: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error editing message:", error)
+    return null
+  }
+}
+
+/**
+ * Pin a chat
+ */
+export async function pinChat(
+  chatId: number,
+  telegramId: number
+): Promise<{ success: boolean; message?: string } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/pin?telegram_id=${telegramId}`,
+      {
+        method: "POST",
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to pin chat: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error pinning chat:", error)
+    return null
+  }
+}
+
+/**
+ * Unpin a chat
+ */
+export async function unpinChat(
+  chatId: number,
+  telegramId: number
+): Promise<{ success: boolean; message?: string } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/pin?telegram_id=${telegramId}`,
+      {
+        method: "DELETE",
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to unpin chat: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error unpinning chat:", error)
+    return null
+  }
+}
+
+/**
+ * Get pinned chats
+ */
+export async function getPinnedChats(
+  telegramId: number
+): Promise<{ pinned_chats: Chat[]; count: number } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/pinned?telegram_id=${telegramId}`,
+      {
+        method: "GET",
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to get pinned chats: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error getting pinned chats:", error)
+    return null
+  }
+}
+
+/**
+ * Mark a message as read
+ */
+export async function markMessageRead(
+  chatId: number,
+  messageId: number,
+  telegramId: number
+): Promise<{ success: boolean; message?: string } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/messages/${messageId}/read?telegram_id=${telegramId}`,
+      {
+        method: "POST",
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to mark message as read: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error marking message as read:", error)
+    return null
+  }
+}
+
+/**
+ * Get message reads (list of users who read the message)
+ */
+export async function getMessageReads(
+  chatId: number,
+  messageId: number,
+  telegramId: number
+): Promise<{ reads: MessageRead[]; count: number } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/messages/${messageId}/reads?telegram_id=${telegramId}`,
+      {
+        method: "GET",
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to get message reads: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error getting message reads:", error)
+    return null
+  }
+}
+
+/**
+ * Mark all messages in a chat as read
+ */
+export async function markChatRead(
+  chatId: number,
+  telegramId: number
+): Promise<{ success: boolean; count: number; message?: string } | null> {
+  try {
+    const res = await apiFetch(
+      `${API_BASE}/chat/${chatId}/read?telegram_id=${telegramId}`,
+      {
+        method: "POST",
+      }
+    )
+    
+    if (!res.ok) {
+      console.error(`Failed to mark chat as read: HTTP ${res.status}`)
+      return null
+    }
+    
+    return await res.json()
+  } catch (error) {
+    console.error("Error marking chat as read:", error)
+    return null
+  }
+}
+
+export interface MessageRead {
+  user_id: number
+  read_at: string
+  user_name: string | null
+  user_telegram_id: number | null
 }
 
 /**
@@ -1182,6 +1830,8 @@ export class ChatWebSocket {
   private onError: (error: Error) => void
   private onChatAssigned?: (chatId: number, operatorId: number) => void
   private onChatInactive?: (chatId: number) => void
+  private onReaction?: (messageId: number, reactions: any[]) => void
+  private onMessageRead?: (messageId: number, userId: number) => void
   private onReconnect?: () => void
   private reconnectAttempts = 0
   private maxReconnectAttempts = 5
@@ -1199,6 +1849,8 @@ export class ChatWebSocket {
     onError: (error: Error) => void,
     onChatAssigned?: (chatId: number, operatorId: number) => void,
     onChatInactive?: (chatId: number) => void,
+    onReaction?: (messageId: number, reactions: any[]) => void,
+    onMessageRead?: (messageId: number, userId: number) => void,
     onReconnect?: () => void
   ) {
     this.chatId = chatId
@@ -1209,6 +1861,8 @@ export class ChatWebSocket {
     this.onError = onError
     this.onChatAssigned = onChatAssigned
     this.onChatInactive = onChatInactive
+    this.onReaction = onReaction
+    this.onMessageRead = onMessageRead
     this.onReconnect = onReconnect
   }
 
@@ -1318,6 +1972,7 @@ export class ChatWebSocket {
 
     switch (eventType) {
       case "message.new":
+      case "message.edited":
       case "chat.message":
       case "new_message":
       case "message_sent": {
@@ -1346,6 +2001,22 @@ export class ChatWebSocket {
         const payload = data.payload ?? data
         if (this.onChatInactive && payload?.chat_id) {
           this.onChatInactive(payload.chat_id)
+        }
+        break
+      }
+      case "message.reaction": {
+        const payload = data.payload ?? data
+        if (this.onReaction && payload?.message_id) {
+          // Call onReaction callback with message_id
+          // ChatContext will fetch updated reactions
+          this.onReaction(payload.message_id, [])
+        }
+        break
+      }
+      case "message.read": {
+        const payload = data.payload ?? data
+        if (this.onMessageRead && payload?.message_id && payload?.user_id) {
+          this.onMessageRead(payload.message_id, payload.user_id)
         }
         break
       }
@@ -1381,8 +2052,22 @@ export class ChatWebSocket {
     console.warn("[ChatWebSocket] sendMessage is deprecated. Use REST API sendMessage instead.")
   }
 
-  sendTyping(): void {
-    console.warn("[ChatWebSocket] sendTyping is deprecated. Typing indicators use REST events.")
+  sendTyping(isTyping: boolean): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.warn(`[ChatWebSocket] Cannot send typing event: WebSocket not connected for chat ${this.chatId}`)
+      return
+    }
+
+    try {
+      const message = JSON.stringify({
+        type: "typing",
+        is_typing: isTyping,
+      })
+      this.ws.send(message)
+      console.log(`[ChatWebSocket] Sent typing event: chat=${this.chatId}, isTyping=${isTyping}`)
+    } catch (error) {
+      console.error(`[ChatWebSocket] Error sending typing event:`, error)
+    }
   }
 
   disconnect(): void {
@@ -1391,7 +2076,14 @@ export class ChatWebSocket {
       this.pingInterval = null
     }
     if (this.ws) {
-      this.ws.close()
+      try {
+        // Only close if connection is open or connecting (not already closed)
+        if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+          this.ws.close()
+        }
+      } catch (error) {
+        // Ignore errors when closing WebSocket (common during unmount)
+      }
       this.ws = null
     }
   }
@@ -1512,18 +2204,26 @@ export class StatsWebSocket {
       }
 
       this.ws.onerror = (error) => {
-        console.error(`[StatsWebSocket] ❌ WebSocket error for user ${this.userId}:`, error, {
-          readyState: this.ws?.readyState,
-          url: wsEndpoint
-        })
+        // Only log WebSocket errors if the connection wasn't already closed
+        // Code 1006 (abnormal closure) is common during React Strict Mode double-mounting
+        if (this.ws?.readyState !== WebSocket.CLOSED && this.ws?.readyState !== WebSocket.CLOSING) {
+          console.warn(`[StatsWebSocket] ⚠️ WebSocket error for user ${this.userId} (will retry)`, {
+            readyState: this.ws?.readyState,
+            url: wsEndpoint
+          })
+        }
       }
 
       this.ws.onclose = (event) => {
-        console.log(`[StatsWebSocket] 🔌 WebSocket closed for user ${this.userId}`, {
-          code: event.code,
-          reason: event.reason,
-          wasClean: event.wasClean
-        })
+        // Only log close events if it wasn't a clean close or abnormal closure (1006)
+        // Code 1006 is common during React Strict Mode or component unmounting
+        if (event.code !== 1000 && event.code !== 1006) {
+          console.log(`[StatsWebSocket] 🔌 WebSocket closed for user ${this.userId}`, {
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean
+          })
+        }
         this.ws = null
         
         if (this.pingInterval) {
@@ -1550,7 +2250,14 @@ export class StatsWebSocket {
       this.pingInterval = null
     }
     if (this.ws) {
-      this.ws.close()
+      try {
+        // Only close if connection is open or connecting (not already closed)
+        if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+          this.ws.close()
+        }
+      } catch (error) {
+        // Ignore errors when closing WebSocket (common during unmount)
+      }
       this.ws = null
     }
   }
@@ -1678,7 +2385,14 @@ export class StaffChatWebSocket {
 
   disconnect(): void {
     if (this.ws) {
-      this.ws.close()
+      try {
+        // Only close if connection is open or connecting (not already closed)
+        if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+          this.ws.close()
+        }
+      } catch (error) {
+        // Ignore errors when closing WebSocket (common during unmount)
+      }
       this.ws = null
     }
   }
@@ -1786,6 +2500,20 @@ export async function getStaffChatMessages(
     
     if (!res.ok) {
       const errorText = await res.text().catch(() => 'Unable to read error response')
+      
+      // Handle 404 specifically - might be backend not running or endpoint missing
+      if (res.status === 404) {
+        console.error(`[getStaffChatMessages] ❌ 404 Not Found for staff chat ${chatId}`, {
+          chatId,
+          telegramId,
+          url,
+          errorBody: errorText,
+          hint: "Backend endpoint might not exist or backend server might not be running"
+        })
+        // Return empty array but log the issue clearly
+        return []
+      }
+      
       console.error(`[getStaffChatMessages] ❌ Failed to fetch staff messages: HTTP ${res.status}`, {
         chatId,
         telegramId,
@@ -1819,6 +2547,14 @@ export async function getStaffChatMessages(
     
     return messages
   } catch (error) {
+    // Silently ignore aborted requests (component unmount, React Strict Mode, etc.)
+    if (error instanceof Error && (error.name === 'AbortError' || error.message === 'API request timeout')) {
+      // Only log timeout errors as warnings (less noisy than errors)
+      if (error.message === 'API request timeout') {
+        console.warn(`[getStaffChatMessages] ⚠️ Request timeout for staff chat ${chatId} (this may be normal in development)`)
+      }
+      return []
+    }
     const errorMsg = error instanceof Error ? error.message : String(error)
     console.error(`[getStaffChatMessages] ❌ Error fetching staff messages for chat ${chatId}:`, {
       chatId,

@@ -32,6 +32,11 @@ interface ChatHeaderProps {
   isReadOnly?: boolean
   isCompact?: boolean
   wsStatus?: "connected" | "reconnecting" | "disconnected"
+  onSearch?: () => void
+  onMediaGallery?: () => void
+  isPinned?: boolean
+  onPinChat?: () => void
+  onUnpinChat?: () => void
 }
 
 export default function ChatHeader({
@@ -43,7 +48,12 @@ export default function ChatHeader({
   isDarkMode,
   isReadOnly,
   isCompact,
-  wsStatus = "connected"
+  wsStatus = "connected",
+  onSearch,
+  onMediaGallery,
+  isPinned,
+  onPinChat,
+  onUnpinChat,
 }: ChatHeaderProps) {
   const { onlineUsers, users } = useChat()
   
@@ -175,6 +185,47 @@ export default function ChatHeader({
       </div>
 
       <div className="flex items-center space-x-1 xs:space-x-1.5 sm:space-x-2 flex-shrink-0">
+        {/* Media Gallery Button */}
+        {onMediaGallery && (
+          <button
+            onClick={onMediaGallery}
+            className="p-1.5 xs:p-1.5 sm:p-2 rounded-lg transition-colors flex-shrink-0 hover:bg-blue-50 active:bg-blue-100 text-blue-600 touch-manipulation min-w-[44px] min-h-[44px] flex items-center justify-center"
+            title="Media Gallery"
+          >
+            <svg className="w-5 h-5 xs:w-5 xs:h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+          </button>
+        )}
+        
+        {/* Pin/Unpin Button */}
+        {(onPinChat || onUnpinChat) && (
+          <button
+            onClick={isPinned ? onUnpinChat : onPinChat}
+            className={`p-1.5 xs:p-1.5 sm:p-2 rounded-lg transition-colors flex-shrink-0 hover:bg-blue-50 active:bg-blue-100 touch-manipulation min-w-[44px] min-h-[44px] flex items-center justify-center ${
+              isPinned ? "text-blue-500" : "text-gray-400"
+            }`}
+            title={isPinned ? "Unpin" : "Pin"}
+          >
+            <svg className="w-5 h-5 xs:w-5 xs:h-5 sm:w-6 sm:h-6" fill="currentColor" viewBox="0 0 20 20">
+              <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z" />
+            </svg>
+          </button>
+        )}
+
+        {/* Search Button */}
+        {onSearch && (
+          <button
+            onClick={onSearch}
+            className="p-1.5 xs:p-1.5 sm:p-2 rounded-lg transition-colors flex-shrink-0 hover:bg-blue-50 active:bg-blue-100 text-blue-600 touch-manipulation min-w-[44px] min-h-[44px] flex items-center justify-center"
+            title="Qidirish"
+          >
+            <svg className="w-5 h-5 xs:w-5 xs:h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+          </button>
+        )}
+        
         {/* WebSocket Status Indicator */}
         {wsStatus === "reconnecting" && (
           <div className="flex items-center space-x-1 px-2 py-1 rounded-full bg-yellow-100 border border-yellow-200">

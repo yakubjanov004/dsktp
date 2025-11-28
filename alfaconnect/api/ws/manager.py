@@ -6,6 +6,7 @@ from collections import defaultdict
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ class ChatWSManager:
         self.use_redis_pubsub = use_redis_pubsub
         self.pubsub_manager = redis_pubsub_manager
         self._pubsub_tasks: Dict[int, asyncio.Task] = {}  # chat_id -> pubsub reader task
+        # Typing status tracking: {chat_id: {user_id: timestamp}}
+        self.typing_status: Dict[int, Dict[int, datetime]] = defaultdict(dict)
+        # Typing timeout in seconds (auto-clear after 3 seconds to match frontend)
+        self.typing_timeout = 3
 
     def handler(self, message_type: str):
         """
@@ -193,6 +198,54 @@ class ChatWSManager:
                 self.user_connections[user_id].discard(websocket)
                 if not self.user_connections[user_id]:
                     del self.user_connections[user_id]
+
+    async def set_typing_status(self, chat_id: int, user_id: int, is_typing: bool):
+        """
+        Set typing status for a user in a chat.
+        
+        Args:
+            chat_id: Chat room ID
+            user_id: User ID
+            is_typing: True if typing, False to clear
+        """
+        async with self._lock:
+            if is_typing:
+                self.typing_status[chat_id][user_id] = datetime.now()
+            else:
+                if chat_id in self.typing_status and user_id in self.typing_status[chat_id]:
+                    del self.typing_status[chat_id][user_id]
+                    if not self.typing_status[chat_id]:
+                        del self.typing_status[chat_id]
+
+    async def broadcast_typing_event(self, chat_id: int, user_id: int, is_typing: bool):
+        """
+        Broadcast typing event to all WebSocket connections in a chat room.
+        
+        Args:
+            chat_id: Chat room ID
+            user_id: User ID who is typing
+            is_typing: True if typing, False to clear
+        """
+        event = {
+            "event": "typing",
+            "payload": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "is_typing": is_typing,
+            }
+        }
+        
+        msg = json.dumps(event, ensure_ascii=False)
+        
+        # If using Redis PubSub, publish to Redis
+        if self.use_redis_pubsub and self.pubsub_manager:
+            try:
+                await self.pubsub_manager.publish(str(chat_id), msg)
+            except Exception as e:
+                logger.error(f"Error publishing typing event to Redis for chat {chat_id}: {e}")
+        
+        # Broadcast directly to local connections
+        await self._broadcast_to_room(chat_id, msg)
 
 
 # Global manager instance (default, without Redis PubSub)

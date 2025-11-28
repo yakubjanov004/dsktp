@@ -30,6 +30,9 @@ import {
   sendStaffMessage as apiSendStaffMessage,
   getAvailableStaff,
   type StaffChat,
+  pinChat,
+  unpinChat,
+  getPinnedChats,
 } from "../lib/api"
 import { normalizeChatId, normalizeChatIdNumber } from "@/utils/chatId"
 
@@ -46,6 +49,9 @@ interface ChatSession {
   lastMessage: Message | null
   clientName?: string
   operatorName?: string | null
+  pinned_at?: string | null
+  position?: number | null
+  isPinned?: boolean
 }
 
 interface ChatContextType {
@@ -58,7 +64,9 @@ interface ChatContextType {
   isLoading: boolean
   activeChatStats: ActiveChatStats | null
   onlineUsers: Set<number>
+  telegramId?: number
   sendMessage: (chatId: string, message: string, senderId: number) => Promise<void>
+  sendTyping: (chatId: string, isTyping: boolean) => void
   closeChat: (chatId: string) => Promise<void>
   startNewChat: (clientId: number) => Promise<string | null>
   markAsRead: (chatId: string, userId: number) => void
@@ -76,6 +84,9 @@ interface ChatContextType {
   startStaffChat: (receiverId: number) => Promise<string | null>
   sendStaffMessage: (chatId: string, message: string, senderId: number) => Promise<void>
   loadStaffChatMessages: (chatId: string, force?: boolean) => Promise<void>
+  // Pin/Unpin functions
+  pinChat: (chatId: string) => Promise<void>
+  unpinChat: (chatId: string) => Promise<void>
   // Auto-open chat callback
   onNewMessage?: (chatId: string) => void
   setOnNewMessage?: (callback: ((chatId: string) => void) | null) => void
@@ -157,6 +168,9 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       lastMessage: null,
       clientName: chat.client_name,
       operatorName: chat.operator_name,
+      pinned_at: chat.pinned_at || null,
+      position: chat.position || null,
+      isPinned: !!(chat.pinned_at || chat.position !== null),
     }
   }, [])
   
@@ -383,10 +397,13 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
             }
           })
         },
-        (userId: number, isTyping: boolean) => {
+        (typingUserId: number, isTyping: boolean) => {
+          // Ignore own typing events (we already know we're typing)
+          if (typingUserId === userId) return
+          
           setTypingUsers((prev) => ({
             ...prev,
-            [`${chatId}-${userId}`]: isTyping,
+            [`${chatId}-${typingUserId}`]: isTyping,
           }))
         },
         (error: Error) => {
@@ -425,6 +442,40 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
           )
           // Update stats if needed (event-driven)
           loadActiveChatStats()
+        },
+        async (messageId: number) => {
+          // Handle reaction update - refresh message reactions
+          const { getMessageReactions } = await import("../lib/api")
+          if (telegramIdRef.current) {
+            const result = await getMessageReactions(
+              normalizeChatIdNumber(chatId) || 0,
+              messageId,
+              telegramIdRef.current
+            )
+            if (result) {
+              // Update message reactions in chat sessions
+              setChatSessions((prev) =>
+                prev.map((chat) => {
+                  if (chat.id === chatId) {
+                    return {
+                      ...chat,
+                      messages: chat.messages.map((msg) =>
+                        msg.id === messageId
+                          ? { ...msg, reactions: result.reactions }
+                          : msg
+                      ),
+                    }
+                  }
+                  return chat
+                })
+              )
+            }
+          }
+        },
+        (messageId: number, userId: number) => {
+          // Handle message.read event - refresh read count from backend
+          // Don't increment locally to avoid duplicates - backend will send updated count
+          // This is just a notification that someone read the message
         },
         () => {
           // Handle reconnect - sync messages with since_ts/since_id
@@ -1045,7 +1096,7 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     }
   }, [])
 
-  const sendMessage = useCallback(async (chatId: string, message: string, senderId: number) => {
+  const sendMessage = useCallback(async (chatId: string, message: string, senderId: number, replyToMessageId?: number | null) => {
     if (!userId) return
     const chatIdNum = normalizeChatIdNumber(chatId)
     if (chatIdNum === null || chatIdNum <= 0) {
@@ -1106,7 +1157,8 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       // Always use REST API to ensure message is saved to database
       // WebSocket will receive the message via real-time update and replace temp message
       // senderType is already determined above
-      const messageId = await apiSendMessage(chatIdNum, userId, messageText, senderType)
+      const { sendMessage: apiSendMessage } = await import("../lib/api")
+      const messageId = await apiSendMessage(chatIdNum, userId, messageText, senderType, undefined, replyToMessageId)
       
       console.log('[ChatContext] sendMessage: Message sent successfully:', {
         messageId,
@@ -1138,6 +1190,13 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
       )
     }
   }, [userId, chatSessions]) // Only depend on userId and chatSessions
+
+  const sendTyping = useCallback((chatId: string, isTyping: boolean) => {
+    const ws = wsConnections.current.get(chatId)
+    if (ws && ws.isConnected()) {
+      ws.sendTyping(isTyping)
+    }
+  }, [])
 
   const closeChat = useCallback(async (chatId: string) => {
     try {
@@ -1919,8 +1978,14 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
             let finalMessages = sortedMessages
             if (force) {
               // Force reload: replace all messages with new ones
-              finalMessages = sortedMessages
-              console.log(`[ChatContext] loadStaffChatMessages: Force reload - replacing all messages with ${finalMessages.length} messages`)
+              // BUT: if we got 0 messages and there are existing messages, keep existing (request might have failed/timed out)
+              if (sortedMessages.length === 0 && existingMessages.length > 0) {
+                console.warn(`[ChatContext] loadStaffChatMessages: Force reload returned 0 messages but chat has ${existingMessages.length} existing messages - keeping existing messages`)
+                finalMessages = existingMessages
+              } else {
+                finalMessages = sortedMessages
+                console.log(`[ChatContext] loadStaffChatMessages: Force reload - replacing all messages with ${finalMessages.length} messages`)
+              }
             } else if (existingMessages.length > 0) {
               // Merge to avoid duplicates
               const merged = [...existingMessages, ...sortedMessages]
@@ -2030,6 +2095,53 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
     }
   }, [userId, telegramId])
 
+  // Pin/Unpin chat functions
+  const handlePinChat = useCallback(async (chatId: string) => {
+    if (!telegramId) return
+    
+    try {
+      const chatIdNum = normalizeChatIdNumber(chatId)
+      if (chatIdNum === null) return
+      
+      const result = await pinChat(chatIdNum, telegramId)
+      if (result?.success) {
+        // Update chat session
+        setChatSessions((prev) =>
+          prev.map((chat) =>
+            chat.id === chatId
+              ? { ...chat, isPinned: true, pinned_at: new Date().toISOString() }
+              : chat
+          )
+        )
+      }
+    } catch (error) {
+      console.error("Error pinning chat:", error)
+    }
+  }, [telegramId])
+
+  const handleUnpinChat = useCallback(async (chatId: string) => {
+    if (!telegramId) return
+    
+    try {
+      const chatIdNum = normalizeChatIdNumber(chatId)
+      if (chatIdNum === null) return
+      
+      const result = await unpinChat(chatIdNum, telegramId)
+      if (result?.success) {
+        // Update chat session
+        setChatSessions((prev) =>
+          prev.map((chat) =>
+            chat.id === chatId
+              ? { ...chat, isPinned: false, pinned_at: null, position: null }
+              : chat
+          )
+        )
+      }
+    } catch (error) {
+      console.error("Error unpinning chat:", error)
+    }
+  }, [telegramId])
+
   // Set callback for auto-opening chat when new message arrives
   const setOnNewMessage = useCallback((callback: ((chatId: string) => void) | null) => {
     onNewMessageRef.current = callback
@@ -2061,7 +2173,9 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
         isLoading,
         activeChatStats,
         onlineUsers,
+        telegramId,
         sendMessage,
+        sendTyping,
         closeChat,
         startNewChat,
         markAsRead,
@@ -2078,6 +2192,8 @@ export function ChatProvider({ children, telegramId, userId, userRole }: ChatPro
         startStaffChat,
         sendStaffMessage,
         loadStaffChatMessages,
+        pinChat: handlePinChat,
+        unpinChat: handleUnpinChat,
         setOnNewMessage,
       }}
     >

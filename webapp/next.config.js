@@ -51,7 +51,19 @@ const nextConfig = {
     // Backend runs locally on the same server
     // Use localhost for internal communication
     const apiPort = process.env.API_PORT || '8001'
-    const backendUrl = process.env.BACKEND_URL || `http://127.0.0.1:${apiPort}`
+    let backendUrl = process.env.BACKEND_URL || `http://127.0.0.1:${apiPort}`
+    
+    // If BACKEND_URL is ngrok URL, fallback to localhost for development
+    // This prevents issues when ngrok tunnel is offline
+    if (backendUrl && (backendUrl.includes('ngrok') || backendUrl.includes('https://'))) {
+      // In development, prefer localhost for reliability
+      // Ngrok URLs can be used in production, but localhost is more reliable for dev
+      const isDevelopment = process.env.NODE_ENV !== 'production'
+      if (isDevelopment) {
+        console.log(`[next.config] Development mode detected, using localhost instead of ${backendUrl}`)
+        backendUrl = `http://127.0.0.1:${apiPort}`
+      }
+    }
     
     return [
       {
@@ -70,6 +82,19 @@ const nextConfig = {
           {
             key: 'Connection',
             value: 'keep-alive',
+          },
+          {
+            key: 'ngrok-skip-browser-warning',
+            value: 'true',
+          },
+        ],
+      },
+      {
+        source: '/:path*',
+        headers: [
+          {
+            key: 'ngrok-skip-browser-warning',
+            value: 'true',
           },
         ],
       },

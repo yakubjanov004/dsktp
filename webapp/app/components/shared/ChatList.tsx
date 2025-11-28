@@ -21,6 +21,9 @@ type ChatListChat = {
   lastMessage: (Message & { text?: string }) | null
   clientName?: string
   operatorName?: string | null
+  pinned_at?: string | null
+  position?: number | null
+  isPinned?: boolean
 }
 
 interface ChatListProps {
@@ -33,6 +36,8 @@ interface ChatListProps {
   groupByDate?: boolean
   isLoading?: boolean
   emptyMessage?: string
+  onPinChat?: (chatId: string) => void
+  onUnpinChat?: (chatId: string) => void
 }
 
 export default function ChatList({
@@ -45,6 +50,8 @@ export default function ChatList({
   groupByDate = true,
   isLoading = false,
   emptyMessage = "Chatlar topilmadi",
+  onPinChat,
+  onUnpinChat,
 }: ChatListProps) {
   const { typingUsers, unreadCounts, onlineUsers } = useChat()
   
@@ -107,9 +114,28 @@ export default function ChatList({
     })
   }
 
-  const sortedChats = [...chats].sort(
+  // Helper function to check if chat is pinned
+  const isChatPinned = (chat: ChatListChat) => chat.isPinned || !!chat.pinned_at
+
+  // Separate pinned and unpinned chats
+  const pinnedChats = chats.filter(isChatPinned)
+  const unpinnedChats = chats.filter(chat => !isChatPinned(chat))
+
+  // Sort pinned chats by position, then by lastActivity
+  const sortedPinnedChats = [...pinnedChats].sort((a, b) => {
+    const posA = a.position ?? 0
+    const posB = b.position ?? 0
+    if (posA !== posB) return posA - posB
+    return resolveDate(b.lastActivity).getTime() - resolveDate(a.lastActivity).getTime()
+  })
+
+  // Sort unpinned chats by lastActivity
+  const sortedUnpinnedChats = [...unpinnedChats].sort(
     (a, b) => resolveDate(b.lastActivity).getTime() - resolveDate(a.lastActivity).getTime()
   )
+
+  // Combine: pinned first, then unpinned
+  const sortedChats = [...sortedPinnedChats, ...sortedUnpinnedChats]
 
   const groupedChats: { label: string | null; items: ChatListChat[] }[] = groupByDate
     ? sortedChats.reduce<{ label: string | null; items: ChatListChat[] }[]>((acc, chat) => {
@@ -205,9 +231,16 @@ export default function ChatList({
                 <div className="flex items-center justify-between mb-1">
                   <div className="flex items-center space-x-2 min-w-0 flex-1">
                     <div className="min-w-0 flex-1">
-                      <h3 className="font-semibold truncate text-blue-900 text-sm sm:text-base">
-                        {otherUser?.full_name || chat.operatorName || chat.clientName || "Noma'lum foydalanuvchi"}
-                      </h3>
+                      <div className="flex items-center space-x-1">
+                        <h3 className="font-semibold truncate text-blue-900 text-sm sm:text-base">
+                          {otherUser?.full_name || chat.operatorName || chat.clientName || "Noma'lum foydalanuvchi"}
+                        </h3>
+                        {isChatPinned(chat) && (
+                          <svg className="w-4 h-4 text-blue-500 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z" />
+                          </svg>
+                        )}
+                      </div>
                       {/* Oxirgi operator nomi - operator_id dan olinadi */}
                       {getOperatorName(chat) && (
                         <p className="text-xs text-blue-600 truncate">
@@ -247,6 +280,24 @@ export default function ChatList({
                     <span className="text-xs text-blue-600 whitespace-nowrap">
                       {formatLastActivity(chat.lastActivity)}
                     </span>
+                    {(onPinChat || onUnpinChat) && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (isChatPinned(chat)) {
+                            onUnpinChat?.(chat.id)
+                          } else {
+                            onPinChat?.(chat.id)
+                          }
+                        }}
+                        className="p-1 hover:bg-blue-100 rounded transition-colors"
+                        title={isChatPinned(chat) ? "Unpin" : "Pin"}
+                      >
+                        <svg className={`w-4 h-4 ${isChatPinned(chat) ? "text-blue-500" : "text-gray-400"}`} fill="currentColor" viewBox="0 0 20 20">
+                          <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z" />
+                        </svg>
+                      </button>
+                    )}
                   </div>
                 </div>
 

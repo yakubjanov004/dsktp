@@ -16,6 +16,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+@manager.handler("typing")
+async def handle_typing(
+    websocket: WebSocket,
+    incoming_message: dict,
+    chat_id: int,
+    user_id: int,
+    user_role: str,
+    chat: dict,
+    **kwargs
+):
+    """
+    Handle typing indicator events.
+    Expected message format: {"type": "typing", "is_typing": bool}
+    """
+    try:
+        is_typing = incoming_message.get("is_typing", True)
+        
+        # Update typing status
+        await manager.set_typing_status(chat_id, user_id, is_typing)
+        
+        # Broadcast typing event to all participants (sender will ignore their own typing)
+        await manager.broadcast_typing_event(chat_id, user_id, is_typing)
+        
+    except Exception as e:
+        logger.error(f"Error handling typing event: {e}", exc_info=True)
+
+
 def can_user_access_chat(user_id: int, chat_id: int, chat: dict) -> bool:
     """
     Check if user can access a chat.
@@ -244,7 +271,8 @@ async def chat_ws(
     except Exception as e:
         logger.exception(f"Unexpected error in WebSocket connection: {e}")
     finally:
-        # Cleanup
+        # Cleanup - clear typing status on disconnect
+        await manager.set_typing_status(chat_id, user_id, False)
         await manager.disconnect(chat_id, websocket)
         await manager.remove_user_connection(user_id, websocket)
         try:

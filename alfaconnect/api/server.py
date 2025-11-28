@@ -11,7 +11,11 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Message
+from pathlib import Path
 
 from api.routes import user, chat, websocket, metrics
 from api.ws import chat as ws_chat
@@ -160,6 +164,16 @@ app.add_middleware(
     **cors_kwargs,
 )
 
+# Middleware to add ngrok-skip-browser-warning header to all responses
+class NgrokSkipWarningMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # Add ngrok-skip-browser-warning header to all responses
+        response.headers["ngrok-skip-browser-warning"] = "true"
+        return response
+
+app.add_middleware(NgrokSkipWarningMiddleware)
+
 # Include routers with /api prefix only (Next.js rewrite strips it and adds again)
 # This way: /api/user/bootstrap → http://localhost:8001/api/user/bootstrap
 app.include_router(user.router, prefix="/api/user", tags=["user"])
@@ -168,6 +182,71 @@ app.include_router(websocket.router, prefix="/api/ws", tags=["websocket"])
 app.include_router(ws_chat.router, prefix="/api", tags=["websocket-new"])  # New WS endpoint: /api/ws/chat
 app.include_router(metrics.router, prefix="/api", tags=["metrics"])
 app.include_router(webapp_auth_router, tags=["webapp-auth"])  # WebApp validation: /api/webapp/validate
+
+
+# Media files endpoint
+@app.get("/api/media/voice/{chat_id}/{filename}")
+async def get_voice_file(
+    chat_id: int,
+    filename: str,
+    telegram_id: int = Query(..., description="Telegram user ID for authorization")
+):
+    """Serve voice message files with access control"""
+    from database.webapp.user_queries import get_user_by_telegram_id
+    from database.webapp.chat_queries import get_chat_by_id
+    import asyncpg
+    
+    # Get user
+    user = await get_user_by_telegram_id(telegram_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_id = user.get('id')
+    user_role = user.get('role', 'client')
+    
+    # Verify chat exists and user has access
+    chat = await get_chat_by_id(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    # Check access: client can only access their own chats, operators can access assigned chats
+    chat_client_id = chat.get('client_id')
+    chat_operator_id = chat.get('operator_id')
+    
+    has_access = False
+    if user_role == 'client' and chat_client_id == user_id:
+        has_access = True
+    elif user_role in ('callcenter_operator', 'callcenter_supervisor'):
+        # Operators can access if assigned or supervisor
+        if user_role == 'callcenter_supervisor' or chat_operator_id == user_id:
+            has_access = True
+    
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # Extract message_id from filename (format: {message_id}.{ext})
+    try:
+        message_id = int(filename.split('.')[0])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename format")
+    
+    # Verify message belongs to this chat
+    conn = await asyncpg.connect(settings.DB_URL)
+    try:
+        message = await conn.fetchrow(
+            "SELECT id, chat_id FROM messages WHERE id = $1",
+            message_id
+        )
+        if not message or message['chat_id'] != chat_id:
+            raise HTTPException(status_code=404, detail="File not found")
+    finally:
+        await conn.close()
+    
+    media_path = Path(settings.MEDIA_ROOT) / "voice" / str(chat_id) / filename
+    if not media_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(media_path, media_type="audio/mpeg")
 
 
 @app.on_event("startup")
